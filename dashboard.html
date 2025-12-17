@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>License Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .header h1 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: #666;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .card h2 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 24px;
+        }
+
+        .sites-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .site-card {
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 20px;
+            transition: all 0.3s;
+        }
+
+        .site-card.active {
+            border-color: #4caf50;
+            background: #f1f8f4;
+        }
+
+        .site-card.inactive {
+            border-color: #f44336;
+            background: #fff5f5;
+            opacity: 0.7;
+        }
+
+        .site-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .site-name {
+            font-weight: bold;
+            font-size: 18px;
+            color: #333;
+        }
+
+        .status-badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .status-active {
+            background: #4caf50;
+            color: white;
+        }
+
+        .status-inactive {
+            background: #f44336;
+            color: white;
+        }
+
+        .site-info {
+            color: #666;
+            font-size: 14px;
+            margin: 10px 0;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.3s;
+            margin-top: 10px;
+        }
+
+        .btn-danger {
+            background: #f44336;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #d32f2f;
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #5568d3;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .license-item {
+            background: #f5f5f5;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .license-key {
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            color: #333;
+            font-weight: bold;
+        }
+
+        .copy-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+        .copy-btn:hover {
+            background: #5568d3;
+        }
+
+        .add-site-form {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+
+        .add-site-form input {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        .add-site-form input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+
+        .error {
+            background: #ffebee;
+            color: #c62828;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .success {
+            background: #e8f5e9;
+            color: #2e7d32;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }
+
+        .empty-state svg {
+            width: 64px;
+            height: 64px;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h1>📋 License Dashboard</h1>
+                    <p>Manage your sites and license keys</p>
+                </div>
+                <button class="btn" onclick="logout()" style="background: #f44336; max-width: 120px;">
+                    Logout
+                </button>
+            </div>
+        </div>
+
+        <div id="error-message" class="error" style="display: none;"></div>
+        <div id="success-message" class="success" style="display: none;"></div>
+
+        <!-- Sites Section -->
+        <div class="card">
+            <h2>🌐 Your Sites</h2>
+            <div id="sites-container" class="sites-grid">
+                <div class="loading">Loading sites...</div>
+            </div>
+
+            <!-- Add Site Form -->
+            <div style="margin-top: 30px; padding-top: 30px; border-top: 2px solid #e0e0e0;">
+                <h3 style="margin-bottom: 15px; color: #333;">Add New Site</h3>
+                <div class="add-site-form">
+                    <input 
+                        type="text" 
+                        id="new-site-input" 
+                        placeholder="Enter site domain (e.g., example.com)"
+                    />
+                    <input 
+                        type="text" 
+                        id="new-site-price" 
+                        placeholder="Price ID (e.g., price_xxxxx)"
+                    />
+                    <button class="btn btn-primary" onclick="addSite()">Add Site</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Licenses Section -->
+        <div class="card">
+            <h2>🔑 Your License Keys</h2>
+            <div id="licenses-container">
+                <div class="loading">Loading licenses...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'https://consentbit-dashboard.web-8fb.workers.dev';
+
+        // Get session token from cookie
+        function getSessionToken() {
+            const cookies = document.cookie.split(';');
+            for (let cookie of cookies) {
+                const [name, value] = cookie.trim().split('=');
+                if (name === 'sb_session') {
+                    return value;
+                }
+            }
+            return null;
+        }
+
+        // Show error message
+        function showError(message) {
+            const errorDiv = document.getElementById('error-message');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            setTimeout(() => {
+                errorDiv.style.display = 'none';
+            }, 5000);
+        }
+
+        // Show success message
+        function showSuccess(message) {
+            const successDiv = document.getElementById('success-message');
+            successDiv.textContent = message;
+            successDiv.style.display = 'block';
+            setTimeout(() => {
+                successDiv.style.display = 'none';
+            }, 3000);
+        }
+
+        // Load dashboard data
+        async function loadDashboard() {
+            const token = getSessionToken();
+            if (!token) {
+                showError('Not authenticated. Please log in.');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/dashboard`, {
+                    credentials: 'include'
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to load dashboard');
+                }
+
+                const data = await response.json();
+                displaySites(data.sites || {});
+            } catch (error) {
+                console.error('Error loading dashboard:', error);
+                showError('Failed to load dashboard data');
+            }
+        }
+
+        // Display sites
+        function displaySites(sites) {
+            const container = document.getElementById('sites-container');
+            
+            if (Object.keys(sites).length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                        </svg>
+                        <p>No sites yet. Add your first site above!</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = Object.keys(sites).map(site => {
+                const siteData = sites[site];
+                const isActive = siteData.status === 'active';
+                
+                return `
+                    <div class="site-card ${isActive ? 'active' : 'inactive'}">
+                        <div class="site-header">
+                            <div class="site-name">${site}</div>
+                            <span class="status-badge ${isActive ? 'status-active' : 'status-inactive'}">
+                                ${siteData.status}
+                            </span>
+                        </div>
+                        <div class="site-info">
+                            <div>Item ID: ${siteData.item_id || 'N/A'}</div>
+                            <div>Quantity: ${siteData.quantity || 1}</div>
+                            ${siteData.created_at ? `<div>Created: ${new Date(siteData.created_at * 1000).toLocaleDateString()}</div>` : ''}
+                        </div>
+                        ${isActive ? `
+                            <button class="btn btn-danger" onclick="removeSite('${site}')">
+                                Remove Site
+                            </button>
+                        ` : '<p style="color: #999; font-size: 12px; margin-top: 10px;">This site has been removed</p>'}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // Add a new site
+        async function addSite() {
+            const siteInput = document.getElementById('new-site-input');
+            const priceInput = document.getElementById('new-site-price');
+            const site = siteInput.value.trim();
+            const price = priceInput.value.trim();
+
+            if (!site || !price) {
+                showError('Please enter both site domain and price ID');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/add-site`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    credentials: 'include',
+                    body: JSON.stringify({ site, price })
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Failed to add site');
+                }
+
+                showSuccess('Site added successfully! Billing will be updated on next invoice.');
+                siteInput.value = '';
+                priceInput.value = '';
+                loadDashboard();
+            } catch (error) {
+                console.error('Error adding site:', error);
+                showError('Failed to add site: ' + error.message);
+            }
+        }
+
+        // Remove a site
+        async function removeSite(site) {
+            if (!confirm(`Are you sure you want to remove ${site}? Billing will be updated automatically.`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/remove-site`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    credentials: 'include',
+                    body: JSON.stringify({ site })
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Failed to remove site');
+                }
+
+                showSuccess('Site removed successfully! Billing updated.');
+                loadDashboard();
+            } catch (error) {
+                console.error('Error removing site:', error);
+                showError('Failed to remove site: ' + error.message);
+            }
+        }
+
+        // Load licenses
+        async function loadLicenses() {
+            const token = getSessionToken();
+            if (!token) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/licenses`, {
+                    credentials: 'include'
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to load licenses');
+                }
+
+                const data = await response.json();
+                displayLicenses(data.licenses || []);
+            } catch (error) {
+                console.error('Error loading licenses:', error);
+                const container = document.getElementById('licenses-container');
+                container.innerHTML = '<div class="error">Failed to load licenses</div>';
+            }
+        }
+
+        // Display licenses
+        function displayLicenses(licenses) {
+            const container = document.getElementById('licenses-container');
+
+            if (licenses.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <p>No license keys yet. Licenses will appear here after payment.</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = licenses.map(license => `
+                <div class="license-item">
+                    <div>
+                        <div class="license-key">${license.license_key}</div>
+                        <div style="font-size: 12px; color: #999; margin-top: 5px;">
+                            Status: ${license.status} | 
+                            Created: ${new Date(license.created_at * 1000).toLocaleDateString()}
+                        </div>
+                    </div>
+                    <button class="copy-btn" onclick="copyLicense('${license.license_key}')">
+                        Copy
+                    </button>
+                </div>
+            `).join('');
+        }
+
+        // Copy license key
+        function copyLicense(key) {
+            navigator.clipboard.writeText(key).then(() => {
+                showSuccess('License key copied to clipboard!');
+            }).catch(err => {
+                showError('Failed to copy license key');
+            });
+        }
+
+        // Logout function
+        function logout() {
+            // Clear session cookie
+            document.cookie = 'sb_session=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
+            // Redirect to login
+            window.location.href = 'login.html';
+        }
+
+        // Check authentication and initialize dashboard
+        window.addEventListener('DOMContentLoaded', async () => {
+            // Check if user is authenticated
+            const token = getSessionToken();
+            if (!token) {
+                // Redirect to login page
+                window.location.href = 'login.html';
+                return;
+            }
+
+            // Verify token is valid by trying to load dashboard
+            try {
+                const response = await fetch(`${API_BASE}/dashboard`, {
+                    credentials: 'include'
+                });
+
+                if (response.status === 401) {
+                    // Token invalid, redirect to login
+                    window.location.href = 'login.html';
+                    return;
+                }
+
+                // User is authenticated, load dashboard
+                loadDashboard();
+                loadLicenses();
+            } catch (error) {
+                console.error('Auth check error:', error);
+                window.location.href = 'login.html';
+            }
+        });
+    </script>
+</body>
+</html>
+

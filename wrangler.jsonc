@@ -9,6 +9,27 @@
 	"compatibility_date": "2025-12-05",
 	"observability": {
 		"enabled": true
+	},
+	"kv_namespaces": [
+		{
+			"binding": "USERS_KV",
+			"id": "c0950aa8ce9543049eefb380271e4cad"
+		},
+	
+		{
+			"binding": "SESSION_KV",
+			"id": "48304b02a76f4deaa261604316a9cacf"
+		}
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "consentbit-licenses",
+			"database_id": "3a0cf7e2-34a9-4d06-a5b7-c1238d13290e"
+		}
+	],
+	"vars": {
+		"DEFAULT_PRICE_ID": "price_1Sc89ISAczuHLTOtGHNji8Ay"
 	}
 	/**
 	 * Smart Placement
