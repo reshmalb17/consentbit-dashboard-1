@@ -1,0 +1,160 @@
+<!-- 
+WEBFLOW LOGIN PAGE CODE - WITH VISUAL FEEDBACK
+Add this code to your Webflow page Footer Code section
+This version shows a loading message and success message to users
+-->
+
+<script>
+(function() {
+    'use strict';
+    
+    // Create a loading/success message element
+    function createMessageElement() {
+        // Check if message element already exists
+        let messageEl = document.getElementById('memberstack-passwordless-message');
+        if (!messageEl) {
+            messageEl = document.createElement('div');
+            messageEl.id = 'memberstack-passwordless-message';
+            messageEl.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(255, 255, 255, 0.95);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 99999;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            `;
+            document.body.appendChild(messageEl);
+        }
+        return messageEl;
+    }
+    
+    function showMessage(text, type) {
+        const messageEl = createMessageElement();
+        const icon = type === 'success' ? '✅' : type === 'loading' ? '⏳' : '❌';
+        const bgColor = type === 'success' ? '#4caf50' : type === 'loading' ? '#2196F3' : '#f44336';
+        
+        messageEl.innerHTML = `
+            <div style="text-align: center; padding: 40px; background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 400px;">
+                <div style="font-size: 64px; margin-bottom: 20px;">${icon}</div>
+                <h2 style="margin: 0 0 15px 0; color: #333;">${text}</h2>
+                ${type === 'loading' ? '<div style="margin-top: 20px;"><div style="display: inline-block; width: 40px; height: 40px; border: 4px solid #f3f3f3; border-top: 4px solid ' + bgColor + '; border-radius: 50%; animation: spin 1s linear infinite;"></div></div>' : ''}
+            </div>
+            <style>
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+            </style>
+        `;
+    }
+    
+    function hideMessage() {
+        const messageEl = document.getElementById('memberstack-passwordless-message');
+        if (messageEl) {
+            setTimeout(() => {
+                messageEl.style.opacity = '0';
+                messageEl.style.transition = 'opacity 0.5s';
+                setTimeout(() => messageEl.remove(), 500);
+            }, 2000);
+        }
+    }
+    
+    // Get email from URL parameter
+    function getEmailFromURL() {
+        const urlParams = new URLSearchParams(window.location.search);
+        return urlParams.get('email');
+    }
+    
+    // Function to trigger Memberstack passwordless
+    function triggerPasswordless(email) {
+        try {
+            // Check for Memberstack SDK (v1 or v2)
+            const memberstack = window.memberstack || window.$memberstack;
+            
+            if (memberstack) {
+                // Create a button with passwordless action
+                const btn = document.createElement('button');
+                btn.setAttribute('data-ms-action', 'passwordless');
+                btn.setAttribute('data-ms-email', email);
+                btn.style.display = 'none';
+                document.body.appendChild(btn);
+                
+                // Auto-click to trigger passwordless
+                btn.click();
+                
+                // Clean up after a moment
+                setTimeout(() => {
+                    btn.remove();
+                }, 100);
+                
+                // Show success message
+                showMessage('Magic link email sent!<br><small style="color: #666; font-weight: normal;">Check your inbox</small>', 'success');
+                hideMessage();
+                
+                return true; // Success
+            } else {
+                return false; // Not ready yet
+            }
+        } catch (error) {
+            showMessage('Error sending magic link. Please try again.', 'error');
+            return false;
+        }
+    }
+    
+    // Main function to handle email detection and passwordless trigger
+    function handleEmailAndTriggerPasswordless() {
+        const email = getEmailFromURL();
+        
+        if (!email) {
+            // No email parameter - this is normal if user visits page directly
+            // Don't show any message, just let the page load normally
+            return;
+        }
+        
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            showMessage('Invalid email address', 'error');
+            return;
+        }
+        
+        // Show loading message
+        showMessage('Sending magic link email...', 'loading');
+        
+        // Try to trigger passwordless with retry logic
+        let attempts = 0;
+        const maxAttempts = 15; // Try for up to ~7.5 seconds
+        
+        const tryTrigger = () => {
+            attempts++;
+            if (triggerPasswordless(email)) {
+                // Success - message already shown in triggerPasswordless
+            } else if (attempts < maxAttempts) {
+                const delay = Math.min(300 * attempts, 1000); // Max 1 second between retries
+                setTimeout(tryTrigger, delay);
+            } else {
+                // Failed after all attempts
+                showMessage('Unable to send magic link. Please refresh the page.', 'error');
+            }
+        };
+        
+        // Start triggering after a short delay to ensure SDK has time to load
+        setTimeout(tryTrigger, 500);
+    }
+    
+    // Wait for DOM to be ready, then check for email
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', handleEmailAndTriggerPasswordless);
+    } else {
+        // DOM already loaded
+        handleEmailAndTriggerPasswordless();
+    }
+})();
+</script>
+
+

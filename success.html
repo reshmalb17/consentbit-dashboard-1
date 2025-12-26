@@ -3,7 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Payment Successful - Get Your Login Link</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Payment Successful - Redirecting to Login</title>
     <style>
         * {
             margin: 0;
@@ -149,41 +152,18 @@
         <p class="subtitle">Your subscription has been activated</p>
 
         <div id="loading" class="loading">
-            Generating your login link...
+            Payment confirmed! Checking email status...
         </div>
 
         <div id="error-message" class="error" style="display: none;"></div>
 
-        <div id="magic-link-section" style="display: none;">
-            <div class="info">
-                <strong>Your Dashboard Login Link</strong><br>
-                Click the link below or copy it to access your dashboard
-            </div>
-
-            <div class="magic-link-box">
-                <a id="magic-link" href="#" class="magic-link" target="_blank"></a>
-                <button class="btn" onclick="copyMagicLink()">📋 Copy Link</button>
-            </div>
-
-            <div>
-                <a id="open-dashboard-btn" href="#" class="btn">🚀 Open Dashboard</a>
-                <button class="btn btn-secondary" onclick="window.location.href='login.html'">Back to Login</button>
-            </div>
-
-            <div class="instructions">
-                <h3>📝 Instructions:</h3>
-                <ol>
-                    <li>Click "Open Dashboard" above, or copy the link</li>
-                    <li>You'll be automatically logged in</li>
-                    <li>Access your sites and license keys</li>
-                    <li>This link expires in 7 days</li>
-                </ol>
-            </div>
-        </div>
+        <!-- Magic link section removed - links are only sent via email, never displayed on website -->
     </div>
 
+    <!-- Memberstack SDK NOT needed here - Webflow login page has it -->
+    <!-- User will be redirected to Webflow login page where Memberstack SDK handles passwordless -->
     <script>
-        const API_BASE = 'https://consentbit-dashboard.web-8fb.workers.dev';
+        const API_BASE = 'https://consentbit-dashboard-test.web-8fb.workers.dev';
 
         // Get parameters from URL (Stripe Payment Links don't support email placeholder)
         function getParamsFromURL() {
@@ -203,95 +183,137 @@
             errorDiv.style.display = 'block';
         }
 
-        // Load magic link
+        // Load payment confirmation - NO MAGIC LINK IS EVER DISPLAYED
         async function loadMagicLink() {
             const params = getParamsFromURL();
             
-            // Build query string - try email first, then session_id, then customer_id, then most recent
+            // Build query string - PRIORITIZE session_id (most reliable), then customer_id, then email
+            // session_id is most reliable because it fetches directly from Stripe
             let queryString = '';
-            if (params.email) {
-                queryString = `?email=${encodeURIComponent(params.email)}`;
-            } else if (params.session_id) {
+            if (params.session_id) {
                 queryString = `?session_id=${encodeURIComponent(params.session_id)}`;
             } else if (params.customer_id) {
                 queryString = `?customer_id=${encodeURIComponent(params.customer_id)}`;
-            } else {
-                // No params - get most recent payment (for testing)
-                queryString = '';
+            } else if (params.email) {
+                queryString = `?email=${encodeURIComponent(params.email)}`;
             }
 
-            // Try to get magic link from API
+            // Try to get email confirmation from API (NO MAGIC LINK RETURNED)
             try {
-                const response = await fetch(`${API_BASE}/get-magic-link${queryString}`);
+                // Add cache-busting parameter properly to existing query string
+                const separator = queryString ? '&' : '?';
+                const response = await fetch(`${API_BASE}/get-magic-link${queryString}${separator}_=${Date.now()}`);
+                
+                if (!response.ok) {
+                    console.error('[success.html] API error:', response.status, response.statusText);
+                    throw new Error(`API returned ${response.status}`);
+                }
+                
                 const data = await response.json();
 
-                if (!response.ok) {
-                    // If not found, show helpful message
-                    const errorMsg = data.message || data.error || 'Login link not ready yet.';
-                    showError(errorMsg + ' Please wait a moment and refresh the page, or check Worker logs for the magic link.');
+                // PRIORITY: Use email from API response (most reliable - comes from Stripe)
+                // Only fall back to URL params if API doesn't return email (shouldn't happen)
+                const email = data.email || 'your email';
+                const emailDisplay = email !== 'your email' ? `<strong>${email}</strong>` : 'your email';
+                
+                // Log if email is missing
+                if (!data.email) {
+                    console.warn('[success.html] No email in API response. Data:', data);
+                }
+                
+                // Redirect to Webflow login page where login page will create and send magic link
+                // Login page will automatically create magic link and trigger Memberstack passwordless
+                if (email && email !== 'your email') {
                     
-                    // Show instructions
+                    // Webflow login page URL - Login page will create magic link and trigger passwordless
+                    const webflowLoginUrl = 'https://memberstack-login-test-713fa5.webflow.io/';
+                    const redirectUrl = `${webflowLoginUrl}?email=${encodeURIComponent(email)}`;
+                    
+                    // Show redirect message briefly, then redirect
                     document.getElementById('loading').innerHTML = `
-                        <div style="text-align: left; background: #f5f5f5; padding: 20px; border-radius: 8px; margin-top: 20px;">
-                            <h3 style="margin-bottom: 10px;">📋 How to get your login link:</h3>
-                            <ol style="margin-left: 20px;">
-                                <li>Check your email (if email was sent)</li>
-                                <li>Check Worker logs: <code>npx wrangler tail</code></li>
-                                <li>Look for "MAGIC LINK FOR TESTING" in the logs</li>
-                                <li>Or contact support with your payment confirmation</li>
-                            </ol>
+                        <div style="text-align: center; padding: 20px;">
+                            <div style="font-size: 48px; margin-bottom: 20px;">✅</div>
+                            <h2 style="color: #4caf50; margin-bottom: 10px;">Payment Successful!</h2>
+                            <h3 style="color: #666; margin-bottom: 10px; font-size: 18px;">Your subscription has been activated</h3>
+                            <p style="font-size: 16px; color: #666; margin-bottom: 20px;">Redirecting to login page...</p>
+                            <p style="color: #999; font-size: 14px; margin-top: 20px;">You will receive a magic link email shortly.</p>
                         </div>
                     `;
+                    
+                    // Redirect IMMEDIATELY - no delay to prevent cached content
+                    // Use replace instead of href to prevent back button issues
+                    // Redirect immediately - don't wait
+                    window.location.replace(redirectUrl);
+                    
+                    // CRITICAL: Return early to prevent showing old message
+                    return;
+                } else {
+                    console.warn('[success.html] ⚠️ No email available - cannot redirect to login page');
+                    showError('Unable to retrieve email. Please contact support.');
                     return;
                 }
 
-                // Display magic link
-                const magicLink = data.magicLink;
-                const linkElement = document.getElementById('magic-link');
-                const openBtn = document.getElementById('open-dashboard-btn');
-
-                linkElement.href = magicLink;
-                linkElement.textContent = magicLink;
-                openBtn.href = magicLink;
-
-                document.getElementById('loading').style.display = 'none';
-                document.getElementById('magic-link-section').style.display = 'block';
-
-                // Store for copy function
-                window.magicLink = magicLink;
-
             } catch (error) {
-                console.error('Error loading magic link:', error);
-                showError('Failed to load login link. Please try refreshing the page or contact support.');
+                console.error('Error loading payment confirmation:', error);
+                // Try to get email from URL params as fallback for redirect
+                const urlParams = new URLSearchParams(window.location.search);
+                const emailFromUrl = urlParams.get('email');
+                
+                // If we have email from URL, try to redirect anyway
+                if (emailFromUrl) {
+                    const webflowLoginUrl = 'https://memberstack-login-test-713fa5.webflow.io';
+                    const redirectUrl = `${webflowLoginUrl}`;
+                    
+                    document.getElementById('loading').innerHTML = `
+                        <div style="text-align: center; padding: 20px;">
+                            <div style="font-size: 48px; margin-bottom: 20px;">✅</div>
+                            <h2 style="color: #4caf50; margin-bottom: 10px;">Payment Successful!</h2>
+                            <h3 style="color: #666; margin-bottom: 10px; font-size: 18px;">Your subscription has been activated</h3>
+                            <p style="font-size: 16px; color: #666; margin-bottom: 20px;">Redirecting to login page...</p>
+                        </div>
+                    `;
+                    
+                    setTimeout(() => {
+                        window.location.href = redirectUrl;
+                    }, 1500);
+                    return;
+                }
+                
+                // If no email available, show generic success message
+                document.getElementById('loading').innerHTML = `
+                    <div style="text-align: center; padding: 20px;">
+                        <div style="font-size: 48px; margin-bottom: 20px;">✅</div>
+                        <h2 style="color: #4caf50; margin-bottom: 10px;">Payment Successful!</h2>
+                        <h3 style="color: #666; margin-bottom: 10px; font-size: 18px;">Your subscription has been activated</h3>
+                        <p style="font-size: 16px; color: #666; margin-bottom: 20px;">
+                            Please visit the login page to access your account.
+                        </p>
+                        <a href="https://memberstack-login-test-713fa5.webflow.io/" style="
+                            display: inline-block;
+                            padding: 12px 24px;
+                            background: #2196F3;
+                            color: white;
+                            text-decoration: none;
+                            border-radius: 6px;
+                            font-weight: 600;
+                            margin-top: 20px;
+                        ">Go to Login Page</a>
+                    </div>
+                `;
             }
         }
 
-        // Copy magic link
-        function copyMagicLink() {
-            if (!window.magicLink) return;
+        // copyMagicLink function removed - magic links are never displayed on the website
 
-            navigator.clipboard.writeText(window.magicLink).then(() => {
-                const btn = event.target;
-                const originalText = btn.textContent;
-                btn.textContent = '✓ Copied!';
-                btn.style.background = '#4caf50';
-                setTimeout(() => {
-                    btn.textContent = originalText;
-                    btn.style.background = '#667eea';
-                }, 2000);
-            }).catch(err => {
-                alert('Failed to copy link. Please select and copy manually.');
-            });
+        // Auto-load payment confirmation on page load
+        // VERSION: 2025-01-19 - Redirects immediately to login page
+        
+        // Start loading immediately - no delay
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', loadMagicLink);
+        } else {
+            loadMagicLink(); // DOM already loaded
         }
-
-        // Auto-load magic link on page load
-        window.addEventListener('DOMContentLoaded', () => {
-            // Wait a moment for webhook to process
-            setTimeout(() => {
-                loadMagicLink();
-            }, 2000); // 2 second delay to allow webhook to process
-        });
     </script>
 </body>
 </html>
-

@@ -92,70 +92,39 @@ function queryDB(sql) {
   }
 }
 
-console.log('\n' + colors.cyan + '='.repeat(80) + colors.reset);
-console.log(colors.bright + colors.cyan + '📊 DATABASE VIEWER - ConsentBit Dashboard' + colors.reset);
-console.log(colors.cyan + '='.repeat(80) + colors.reset + '\n');
 
 // Payments
-console.log(colors.bright + colors.magenta + '💳 PAYMENTS TABLE' + colors.reset);
-console.log(colors.dim + '-'.repeat(80) + colors.reset);
 const payments = queryDB(`SELECT id, customer_id, email, amount, currency, status, magic_link, created_at FROM payments ORDER BY created_at DESC LIMIT 20`);
 
 if (payments.length > 0) {
   payments.forEach((p, i) => {
-    console.log(`\n${colors.blue}[${i + 1}]${colors.reset} ${colors.bright}Payment ID:${colors.reset} ${colors.yellow}${p.id}${colors.reset}`);
-    console.log(`    ${colors.dim}Customer:${colors.reset} ${p.customer_id}`);
-    console.log(`    ${colors.dim}Email:${colors.reset} ${colors.cyan}${p.email}${colors.reset}`);
-    console.log(`    ${colors.dim}Amount:${colors.reset} ${colors.green}${formatCurrency(p.amount, p.currency)}${colors.reset}`);
-    console.log(`    ${colors.dim}Status:${colors.reset} ${p.status === 'succeeded' ? colors.green : colors.yellow}${p.status}${colors.reset}`);
     const hasLink = p.magic_link && p.magic_link.trim() !== '';
-    console.log(`    ${colors.dim}Magic Link:${colors.reset} ${hasLink ? colors.green + '✓ Yes' : colors.red + '✗ No'}${colors.reset}`);
     if (p.created_at) {
       const date = typeof p.created_at === 'number' ? new Date(p.created_at * 1000).toLocaleString() : p.created_at;
-      console.log(`    ${colors.dim}Created:${colors.reset} ${date}`);
     }
     if (hasLink) {
-      console.log(`    ${colors.dim}Link:${colors.reset} ${colors.cyan}${p.magic_link.substring(0, 80)}...${colors.reset}`);
     }
   });
 } else {
-  console.log(colors.yellow + 'No payments found' + colors.reset);
 }
 
 // Licenses
-console.log('\n\n' + colors.cyan + '='.repeat(80) + colors.reset);
-console.log(colors.bright + colors.magenta + '🔑 LICENSES TABLE' + colors.reset);
-console.log(colors.dim + '-'.repeat(80) + colors.reset);
 const licenses = queryDB(`SELECT id, customer_id, subscription_id, license_key, status, datetime(created_at, 'unixepoch') as created_at FROM licenses ORDER BY created_at DESC LIMIT 20`);
 
 if (licenses.length > 0) {
   licenses.forEach((l, i) => {
-    console.log(`\n${colors.blue}[${i + 1}]${colors.reset} ${colors.bright}License ID:${colors.reset} ${colors.yellow}${l.id}${colors.reset}`);
-    console.log(`    ${colors.dim}Customer:${colors.reset} ${l.customer_id}`);
-    console.log(`    ${colors.dim}Subscription:${colors.reset} ${l.subscription_id}`);
-    console.log(`    ${colors.dim}License Key:${colors.reset} ${colors.green}${l.license_key}${colors.reset}`);
-    console.log(`    ${colors.dim}Status:${colors.reset} ${l.status === 'active' ? colors.green : colors.yellow}${l.status}${colors.reset}`);
     if (l.created_at) {
       const date = typeof l.created_at === 'number' ? new Date(l.created_at * 1000).toLocaleString() : l.created_at;
-      console.log(`    ${colors.dim}Created:${colors.reset} ${date}`);
     }
   });
 } else {
-  console.log(colors.yellow + 'No licenses found' + colors.reset);
 }
 
 // Summary
-console.log('\n\n' + colors.cyan + '='.repeat(80) + colors.reset);
-console.log(colors.bright + colors.magenta + '📈 SUMMARY' + colors.reset);
-console.log(colors.dim + '-'.repeat(80) + colors.reset);
 
 const paymentCount = queryDB('SELECT COUNT(*) as count FROM payments');
 const licenseCount = queryDB('SELECT COUNT(*) as count FROM licenses');
 const activeLicenses = queryDB("SELECT COUNT(*) as count FROM licenses WHERE status = 'active'");
 
-console.log(`${colors.bright}Total Payments:${colors.reset} ${colors.green}${paymentCount[0]?.count || 0}${colors.reset}`);
-console.log(`${colors.bright}Total Licenses:${colors.reset} ${colors.green}${licenseCount[0]?.count || 0}${colors.reset}`);
-console.log(`${colors.bright}Active Licenses:${colors.reset} ${colors.green}${activeLicenses[0]?.count || 0}${colors.reset}`);
 
-console.log('\n' + colors.cyan + '='.repeat(80) + colors.reset + '\n');
 

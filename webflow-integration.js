@@ -11,7 +11,7 @@
 (function() {
   // ===== CONFIGURATION =====
   // Your Cloudflare Worker URL
-  const API_URL = 'https://consentbit-dashboard.web-8fb.workers.dev/create-checkout-session';
+  const API_URL = 'https://consentbit-dashboard-test.web-8fb.workers.dev/create-checkout-session';
   
   // ===== OPTION 1: Button Click Handler =====
   // If you have a button with ID "checkout-btn" or class "checkout-button"

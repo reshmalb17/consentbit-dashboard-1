@@ -1,0 +1,101 @@
+<!-- 
+WEBFLOW LOGIN PAGE CODE - SIMPLIFIED VERSION
+Since you already have Memberstack SDK loaded, this is a minimal version.
+
+INSTRUCTIONS:
+1. In Webflow, go to your login page
+2. Go to Page Settings → Custom Code
+3. Add ONLY the code below (the <script> section) to the "Footer Code" section
+4. Your existing Memberstack SDK script should already be in Header Code or elsewhere
+5. Publish your site
+-->
+
+<script>
+(function() {
+    'use strict';
+    
+    
+    // Get email from URL parameter
+    function getEmailFromURL() {
+        const urlParams = new URLSearchParams(window.location.search);
+        return urlParams.get('email');
+    }
+    
+    // Function to trigger Memberstack passwordless
+    function triggerPasswordless(email) {
+        try {
+            // Check for Memberstack SDK (v1 or v2)
+            const memberstack = window.memberstack || window.$memberstack;
+            
+            if (memberstack) {
+                
+                // Create a button with passwordless action
+                const btn = document.createElement('button');
+                btn.setAttribute('data-ms-action', 'passwordless');
+                btn.setAttribute('data-ms-email', email);
+                btn.style.display = 'none';
+                document.body.appendChild(btn);
+                
+                // Auto-click to trigger passwordless
+                btn.click();
+                
+                // Clean up after a moment
+                setTimeout(() => {
+                    btn.remove();
+                }, 100);
+                
+                return true; // Success
+            } else {
+                return false; // Not ready yet
+            }
+        } catch (error) {
+            console.error('[Webflow Login] Error triggering passwordless:', error);
+            return false;
+        }
+    }
+    
+    // Main function to handle email detection and passwordless trigger
+    function handleEmailAndTriggerPasswordless() {
+        const email = getEmailFromURL();
+        
+        if (!email) {
+            return;
+        }
+        
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            console.error('[Webflow Login] Invalid email format:', email);
+            return;
+        }
+        
+        
+        // Try to trigger passwordless with retry logic
+        let attempts = 0;
+        const maxAttempts = 15; // Try for up to ~7.5 seconds
+        
+        const tryTrigger = () => {
+            attempts++;
+            if (triggerPasswordless(email)) {
+            } else if (attempts < maxAttempts) {
+                const delay = Math.min(300 * attempts, 1000); // Max 1 second between retries
+                setTimeout(tryTrigger, delay);
+            } else {
+                console.error('[Webflow Login] ❌ Failed to trigger passwordless after', maxAttempts, 'attempts');
+            }
+        };
+        
+        // Start triggering after a short delay to ensure SDK has time to load
+        setTimeout(tryTrigger, 500);
+    }
+    
+    // Wait for DOM to be ready, then check for email
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', handleEmailAndTriggerPasswordless);
+    } else {
+        // DOM already loaded
+        handleEmailAndTriggerPasswordless();
+    }
+})();
+</script>
+

@@ -1,0 +1,21 @@
+# Commands to create refunds table
+# Option 1: Using database UUID directly (if wrangler.jsonc is not recognized)
+
+# Step 1: Create the table
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE TABLE IF NOT EXISTS refunds (id INTEGER PRIMARY KEY AUTOINCREMENT, refund_id TEXT NOT NULL UNIQUE, payment_intent_id TEXT NOT NULL, charge_id TEXT NOT NULL, customer_id TEXT NOT NULL, user_email TEXT, amount INTEGER NOT NULL, currency TEXT NOT NULL DEFAULT 'usd', status TEXT NOT NULL DEFAULT 'succeeded', reason TEXT, queue_id TEXT, license_key TEXT, subscription_id TEXT, attempts INTEGER, metadata TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()));"
+
+# Step 2: Create indexes
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE INDEX IF NOT EXISTS idx_refunds_refund_id ON refunds(refund_id);"
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE INDEX IF NOT EXISTS idx_refunds_payment_intent_id ON refunds(payment_intent_id);"
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE INDEX IF NOT EXISTS idx_refunds_charge_id ON refunds(charge_id);"
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE INDEX IF NOT EXISTS idx_refunds_customer_id ON refunds(customer_id);"
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE INDEX IF NOT EXISTS idx_refunds_user_email ON refunds(user_email);"
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE INDEX IF NOT EXISTS idx_refunds_queue_id ON refunds(queue_id);"
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE INDEX IF NOT EXISTS idx_refunds_license_key ON refunds(license_key);"
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE INDEX IF NOT EXISTS idx_refunds_subscription_id ON refunds(subscription_id);"
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE INDEX IF NOT EXISTS idx_refunds_status ON refunds(status);"
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="CREATE INDEX IF NOT EXISTS idx_refunds_created_at ON refunds(created_at);"
+
+# Step 3: Verify table was created
+wrangler d1 execute 3a0cf7e2-34a9-4d06-a5b7-c1238d13290e --remote --command="SELECT name FROM sqlite_master WHERE type='table' AND name='refunds';"
+

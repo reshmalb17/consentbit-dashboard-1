@@ -45,7 +45,6 @@ class TransactionContext {
     }
 
     this.rolledBack = true;
-    console.log(`Rolling back transaction ${this.operationId} (${this.operations.length} operations)`);
 
     // Rollback in reverse order
     for (let i = this.operations.length - 1; i >= 0; i--) {
@@ -53,7 +52,6 @@ class TransactionContext {
       try {
         if (op.rollback) {
           await op.rollback();
-          console.log(`Rolled back operation ${i}: ${op.type}`);
         }
       } catch (error) {
         console.error(`Failed to rollback operation ${i} (${op.type}):`, error);
@@ -87,7 +85,6 @@ async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
       lastError = error;
       if (attempt < maxRetries - 1) {
         const delay = baseDelay * Math.pow(2, attempt);
-        console.log(`Retry attempt ${attempt + 1}/${maxRetries} after ${delay}ms`);
         await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
@@ -107,7 +104,6 @@ async function executeTransaction(env, operationId, operations) {
     const existing = await env.USERS_KV.get(idempotencyKey);
     if (existing) {
       const result = JSON.parse(existing);
-      console.log(`Operation ${operationId} already completed (idempotent)`);
       return { success: true, result: result.result, idempotent: true };
     }
 
@@ -172,7 +168,6 @@ function createStripeItemOp(env, subscriptionId, priceId, site, metadata = {}) {
       if (this.result && this.result.itemId) {
         try {
           await stripeFetch(env, `/subscription_items/${this.result.itemId}`, 'DELETE');
-          console.log(`Rolled back: Deleted Stripe item ${this.result.itemId}`);
         } catch (error) {
           console.error(`Failed to rollback Stripe item ${this.result.itemId}:`, error);
         }
@@ -217,7 +212,6 @@ function deleteStripeItemOp(env, itemId, site) {
             'metadata[site]': originalItem.metadata?.site || site
           };
           await stripeFetch(env, '/subscription_items', 'POST', form, true);
-          console.log(`Rolled back: Restored Stripe item for ${site}`);
         } catch (error) {
           console.error(`Failed to rollback Stripe item deletion:`, error);
         }
@@ -251,7 +245,6 @@ function updateKVUserOp(env, customerId, updateFn) {
       if (originalUser !== null) {
         const userKey = `user:${customerId}`;
         await env.USERS_KV.put(userKey, JSON.stringify(originalUser));
-        console.log(`Rolled back: Restored KV user record for ${customerId}`);
       }
     }
   };
@@ -289,7 +282,6 @@ function insertLicenseOp(env, customerId, subscriptionId, licenseKey, siteDomain
       if (insertedId && env.DB) {
         try {
           await env.DB.prepare('DELETE FROM licenses WHERE id = ?').bind(insertedId).run();
-          console.log(`Rolled back: Deleted license ${insertedId}`);
         } catch (error) {
           console.error(`Failed to rollback license insert:`, error);
         }
