@@ -225,3 +225,29 @@ CREATE INDEX IF NOT EXISTS idx_refunds_license_key ON refunds(license_key);
 CREATE INDEX IF NOT EXISTS idx_refunds_subscription_id ON refunds(subscription_id);
 CREATE INDEX IF NOT EXISTS idx_refunds_status ON refunds(status);
 CREATE INDEX IF NOT EXISTS idx_refunds_created_at ON refunds(created_at);
+
+
+-- Sites queue table - stores pending site processing tasks (Use Case 2)
+CREATE TABLE IF NOT EXISTS sitesqueue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  queueid TEXT NOT NULL UNIQUE,
+  customerid TEXT NOT NULL,
+  useremail TEXT NOT NULL,
+  subscriptionid TEXT NOT NULL,
+  paymentintentid TEXT,
+  priceid TEXT,
+  sites_json TEXT NOT NULL,
+  billingperiod TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER DEFAULT 0,
+  max_attempts INTEGER DEFAULT 3,
+  error_message TEXT,
+  createdat INTEGER NOT NULL DEFAULT (unixepoch()),
+  updatedat INTEGER NOT NULL DEFAULT (unixepoch()),
+  processedat INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_sitesqueue_status ON sitesqueue(status);
+CREATE INDEX IF NOT EXISTS idx_sitesqueue_useremail ON sitesqueue(useremail);
+CREATE INDEX IF NOT EXISTS idx_sitesqueue_subscriptionid ON sitesqueue(subscriptionid);
+CREATE INDEX IF NOT EXISTS idx_sitesqueue_queueid ON sitesqueue(queueid);

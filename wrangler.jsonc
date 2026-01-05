@@ -14,7 +14,17 @@
 			"database_id": "3a0cf7e2-34a9-4d06-a5b7-c1238d13290e"
 		}
 	],
+	"kv_namespaces": [
+		{
+			"binding": "ACTIVE_SITES_CONSENTBIT",
+			"id": "66c7aa5c7fcb4c2a8dfec5463e86a293"
+		},
+		{
+			"binding": "SUBSCRIPTION_CONSENTBIT",
+			"id": "c46f2faa3cf74039ac7207bdb20ad8fa"
+		}
+	],
 	"triggers": {
-		"crons": ["*/5 * * * *"]
+		"crons": ["*/1 * * * *"]
 	}
 }

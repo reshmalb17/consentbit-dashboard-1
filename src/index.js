@@ -79,7 +79,7 @@ const STRIPE_BASE = 'https://api.stripe.com/v1';
 // Note: Cloudflare Workers don't support ES6 imports from local files in the same way
 // We'll inline the transaction logic or use a different approach
 
-// Generate a unique license key
+// Generate a random license key (internal function - use generateUniqueLicenseKey or generateLicenseKeys instead)
 function generateLicenseKey() {
   // Generate a random license key format: KEY-XXXX-XXXX-XXXX
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Exclude confusing chars
@@ -93,14 +93,357 @@ function generateLicenseKey() {
   }).join('-');
   return `KEY-${key}`;
 }
-
-// Generate multiple license keys
-function generateLicenseKeys(count) {
-  const keys = [];
-  for (let i = 0; i < count; i++) {
-    keys.push(generateLicenseKey());
+// Enqueue site purchase job (Use Case 2 -> process later from sitesqueue)
+async function enqueueSiteQueueItem(env, {
+  customerId,
+  userEmail,
+  subscriptionId,
+  sites,
+  billingPeriod,
+  priceId,
+  paymentIntentId,
+}) {
+  if (!env.DB) {
+    console.warn('[USE CASE 2 - QUEUE] No DB configured, skipping enqueue');
+    return null;
   }
-  return keys;
+
+  const queueId = `sitequeue_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sitesJson = JSON.stringify(sites || []);
+
+  const res = await env.DB.prepare(`
+    INSERT INTO sitesqueue (
+      queueid,
+      customerid,
+      useremail,
+      subscriptionid,
+      paymentintentid,
+      priceid,
+      sites_json,
+      billingperiod,
+      status,
+      createdat,
+      updatedat
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    queueId,
+    customerId,
+    userEmail.toLowerCase().trim(),
+    subscriptionId || null,
+    paymentIntentId || null,
+    priceId || null,
+    sitesJson,
+    billingPeriod || null,
+    'pending',
+    timestamp,
+    timestamp
+  ).run();
+
+  if (!res.success) {
+    console.error('[USE CASE 2 - QUEUE] Failed to enqueue site job', res);
+    return null;
+  }
+
+  console.log('[USE CASE 2 - QUEUE] Enqueued site job', queueId, 'for', sites.length, 'site(s)');
+  return queueId;
+}
+
+
+// Helper: map billing_period -> Stripe price id
+function getPriceIdForSite(env, billingPeriod) {
+  if (billingPeriod === 'yearly') return env.STRIPE_SITE_YEARLY_PRICE_ID;
+  return env.STRIPE_SITE_MONTHLY_PRICE_ID;
+}
+
+
+function getSitePriceId(env, billingPeriod) {
+  if (billingPeriod === 'yearly') return env.STRIPE_SITE_YEARLY_PRICE_ID;
+  return env.STRIPE_SITE_MONTHLY_PRICE_ID;
+}
+
+
+
+// Generate a single unique license key with database check
+async function generateTempLicenseKeys(quantity) {
+  return Array.from({ length: quantity }, (_, i) => {
+    return `L${i + 1}`;
+  });
+}
+
+// Check if a license key is temporary (placeholder)
+function isTemporaryLicenseKey(key) {
+  if (!key || typeof key !== 'string') return false;
+  // Temporary keys start with "L" followed by numbers (e.g., "L1", "L2", "L10")
+  // or start with "TEMP-" (e.g., "TEMP-1", "TEMP-2")
+  return /^L\d+$/.test(key) || /^TEMP-/.test(key);
+}
+
+// Generate a single unique license key with database check
+async function generateUniqueLicenseKey(env) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const makeKey = () =>
+    'KEY-' +
+    Array.from({ length: 4 })
+      .map(() =>
+        Array.from({ length: 4 })
+          .map(() => chars[Math.floor(Math.random() * chars.length)])
+          .join('')
+      )
+      .join('-');
+
+  for (let i = 0; i < 50; i++) {
+    const key = makeKey();
+
+    if (!env?.DB) return key;
+
+    const exists = await env.DB.prepare(
+      'SELECT license_key FROM licenses WHERE license_key = ? LIMIT 1'
+    ).bind(key).first();
+
+    if (!exists) return key;
+  }
+
+  throw new Error('Failed to generate unique license key');
+}
+
+// Generate multiple license keys with uniqueness check
+async function handleCreateSiteCheckout(request, env) {
+  const url = new URL(request.url);
+
+  console.log('[CREATE-SITE-CHECKOUT] 📥 Request received');
+
+  /* ─────────────────────────────
+     PARSE BODY
+  ───────────────────────────── */
+  let body;
+  try {
+    body = await request.json();
+    console.log('[CREATE-SITE-CHECKOUT] 📋 Request body:', {
+      email: body.email ? 'provided' : 'not provided',
+      billing_period: body.billing_period,
+      sites: Array.isArray(body.sites) ? body.sites.length : 0,
+    });
+  } catch (err) {
+    console.error('[CREATE-SITE-CHECKOUT] ❌ Error parsing request body:', err);
+    return jsonResponse(400, {
+      error: 'invalid_request',
+      message: 'Invalid JSON in request body',
+    }, true, request);
+  }
+
+  const { email: emailParam, sites, billing_period: billingPeriodParam } = body;
+  const sitesArray = Array.isArray(sites) ? sites : [];
+
+  if (!sitesArray.length) {
+    console.log('[CREATE-SITE-CHECKOUT] ❌ No sites provided');
+    return jsonResponse(400, {
+      error: 'missing_sites',
+      message: 'At least one site is required',
+    }, true, request);
+  }
+
+  /* ─────────────────────────────
+     AUTH / EMAIL (same as purchase-quantity)
+  ───────────────────────────── */
+  let email = emailParam?.toLowerCase().trim();
+
+  if (!email) {
+    const cookie = request.headers.get('cookie') || '';
+    const match = cookie.match(/sb_session=([^;]+)/);
+    if (!match) {
+      return jsonResponse(401, { error: 'unauthenticated' }, true, request);
+    }
+
+    const payload = await verifyToken(env, match[1]);
+    if (!payload?.email) {
+      return jsonResponse(401, { error: 'invalid_session' }, true, request);
+    }
+
+    email = payload.email;
+  }
+
+  if (!email.includes('@')) {
+    console.log('[CREATE-SITE-CHECKOUT] ❌ Invalid email format:', email);
+    return jsonResponse(400, { error: 'invalid_email' }, true, request);
+  }
+
+  console.log('[CREATE-SITE-CHECKOUT] ✅ Email validated:', email);
+
+  /* ─────────────────────────────
+     LOAD USER & CUSTOMER (exactly like purchase-quantity)
+  ───────────────────────────── */
+  console.log('[CREATE-SITE-CHECKOUT] 🔍 Loading user from database...');
+  const user = await getUserByEmail(env, email);
+
+  if (!user?.customers?.length) {
+    console.log('[CREATE-SITE-CHECKOUT] ❌ No customer found for email:', email);
+    return jsonResponse(400, {
+      error: 'no_customer',
+      message: 'Customer account required',
+    }, true, request);
+  }
+
+  console.log('[CREATE-SITE-CHECKOUT] ✅ User found with', user.customers.length, 'customer(s)');
+
+  let customerId = null;
+  if (user.customers && user.customers.length > 0) {
+    customerId = user.customers[0].customerId;
+  }
+
+  if (!customerId) {
+    return jsonResponse(400, {
+      error: 'no_customer',
+      message: 'Customer account required',
+    }, true, request);
+  }
+
+  /* ─────────────────────────────
+     PRICE CONFIG (reuse purchase-quantity logic)
+  ───────────────────────────── */
+  if (!billingPeriodParam) {
+    console.log('[CREATE-SITE-CHECKOUT] ❌ Billing period not provided');
+    return jsonResponse(400, {
+      error: 'billing_period_required',
+      message: 'billing_period is required. Please provide "monthly" or "yearly".',
+    }, true, request);
+  }
+
+  const normalizedPeriod = billingPeriodParam.toLowerCase().trim();
+  console.log('[CREATE-SITE-CHECKOUT] 📅 Billing period:', normalizedPeriod);
+
+  let productId, unitAmount, currency;
+  if (normalizedPeriod === 'monthly') {
+    productId = env.MONTHLY_PRODUCT_ID || env.MONTHLY_LICENSE_PRODUCT_ID || 'prod_TiX0VbsXQSm4N5';
+    unitAmount = parseInt(env.MONTHLY_UNIT_AMOUNT || env.MONTHLY_LICENSE_UNIT_AMOUNT || '800');
+    currency = env.MONTHLY_CURRENCY || env.CURRENCY || 'usd';
+    console.log('[CREATE-SITE-CHECKOUT] 💰 Monthly config:', { productId, unitAmount, currency });
+  } else if (normalizedPeriod === 'yearly') {
+    productId = env.YEARLY_PRODUCT_ID || env.YEARLY_LICENSE_PRODUCT_ID || 'prod_TiX0CF9K1RSRyb';
+    unitAmount = parseInt(env.YEARLY_UNIT_AMOUNT || env.YEARLY_LICENSE_UNIT_AMOUNT || '7200');
+    currency = env.YEARLY_CURRENCY || env.CURRENCY || 'usd';
+    console.log('[CREATE-SITE-CHECKOUT] 💰 Yearly config:', { productId, unitAmount, currency });
+  } else {
+    console.log('[CREATE-SITE-CHECKOUT] ❌ Invalid billing period:', billingPeriodParam);
+    return jsonResponse(400, {
+      error: 'invalid_billing_period',
+      message: `Invalid billing_period: ${billingPeriodParam}. Must be "monthly" or "yearly".`,
+    }, true, request);
+  }
+
+  if (!productId) {
+    console.log('[CREATE-SITE-CHECKOUT] ❌ Product ID not configured for:', normalizedPeriod);
+    return jsonResponse(500, {
+      error: 'product_id_not_configured',
+      message: `${normalizedPeriod.charAt(0).toUpperCase() + normalizedPeriod.slice(1)} product ID not configured.`,
+    }, true, request);
+  }
+
+  const storedUnitAmount = unitAmount;
+  const storedCurrency = currency;
+  console.log(`[CREATE-SITE-CHECKOUT] ✅ Price config loaded (${normalizedPeriod}):`, {
+    productId,
+    storedUnitAmount,
+    storedCurrency,
+  });
+
+  /* ─────────────────────────────
+     STEP 1: CALCULATE AMOUNT (like purchase-quantity)
+  ───────────────────────────── */
+  const totalSites = sitesArray.length;
+  let totalAmount = storedUnitAmount * totalSites;
+  let invoiceCurrency = storedCurrency || 'usd';
+
+  console.log(`[CREATE-SITE-CHECKOUT] Using unit_amount from env: ${storedUnitAmount}, sites: ${totalSites}, total: ${totalAmount}`);
+
+  /* ─────────────────────────────
+     STEP 2: PREPARE METADATA FOR AFTER PAYMENT
+  ───────────────────────────── */
+  try {
+    await stripeFetch(env, `/customers/${customerId}`, 'POST', {
+      'metadata[sites_pending]': JSON.stringify(sitesArray),
+      'metadata[usecase]': 'sites',
+      'metadata[billing_period]': normalizedPeriod,
+    }, true);
+  } catch (metadataErr) {
+    console.warn('[CREATE-SITE-CHECKOUT] ⚠️ Failed to store metadata in customer:', metadataErr);
+    // Non-critical
+  }
+
+  /* ─────────────────────────────
+     STEP 3: CREATE CHECKOUT SESSION (mode: payment, like purchase-quantity)
+  ───────────────────────────── */
+  const dashboardUrl =
+    env.MEMBERSTACK_REDIRECT_URL ||
+    'https://memberstack-login-test-713fa5.webflow.io/dashboard';
+
+  const form = {
+    mode: 'payment', // one-time payment, subscriptions created later in webhook
+    customer: customerId,
+    'payment_method_types[0]': 'card',
+    'line_items[0][price_data][currency]': invoiceCurrency,
+    'line_items[0][price_data][unit_amount]': totalAmount,
+    'line_items[0][price_data][product]': productId,
+    'line_items[0][quantity]': 1,
+    'payment_intent_data[metadata][usecase]': 'sites',
+    'payment_intent_data[metadata][customer_id]': customerId,
+    'payment_intent_data[metadata][billing_period]': normalizedPeriod,
+    'payment_intent_data[metadata][sites_json]': JSON.stringify(sitesArray),
+    'payment_intent_data[metadata][currency]': invoiceCurrency,
+    'payment_intent_data[setup_future_usage]': 'off_session',
+    'success_url': `${dashboardUrl}?session_id={CHECKOUT_SESSION_ID}&payment=success`,
+    'cancel_url': dashboardUrl,
+  };
+
+  console.log('[CREATE-SITE-CHECKOUT] 💳 Creating Stripe checkout session...', {
+    amount: totalAmount,
+    currency: invoiceCurrency,
+    totalSites,
+    productId,
+  });
+
+  const session = await stripeFetch(env, '/checkout/sessions', 'POST', form, true);
+
+  if (session.status >= 400) {
+    console.error('[CREATE-SITE-CHECKOUT] ❌ Checkout session creation failed:', {
+      status: session.status,
+      body: session.body,
+    });
+
+    return jsonResponse(500, {
+      error: 'checkout_failed',
+      message: 'Failed to create checkout session',
+      details: session.body,
+    }, true, request);
+  }
+
+  console.log('[CREATE-SITE-CHECKOUT] ✅ Checkout session created successfully:', {
+    session_id: session.body.id,
+    checkout_url: session.body.url ? 'present' : 'missing',
+  });
+
+  const response = {
+    checkout_url: session.body.url,
+    session_id: session.body.id,
+    amount: totalAmount,
+    currency: invoiceCurrency,
+    sites: totalSites,
+    billing_period: normalizedPeriod,
+  };
+
+  console.log('[CREATE-SITE-CHECKOUT] 📤 Returning response:', {
+    has_checkout_url: !!response.checkout_url,
+    session_id: response.session_id,
+    sites: response.sites,
+  });
+
+  return jsonResponse(200, response, true, request);
+}
+
+
+
+async function generateTempLicenceKey(count) {
+  
 }
 
 // Generate a secure random password for Memberstack members
@@ -122,11 +465,17 @@ function getCorsHeaders(request) {
     'https://memberstack-login-test-713fa5.webflow.io',
     'https://consentbit-dashboard-test.web-8fb.workers.dev',
     'http://localhost:3000',
-    'http://localhost:8080'
+    'http://localhost:8080',
+    'http://localhost:1337',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:5175'
   ];
   
   // If origin is in allowed list, use it; otherwise use wildcard (but won't work with credentials)
-  const corsOrigin = origin && allowedOrigins.includes(origin) ? origin : '*';
+  // For localhost development, allow any localhost origin
+  const isLocalhost = origin && origin.startsWith('http://localhost:');
+  const corsOrigin = (origin && allowedOrigins.includes(origin)) || isLocalhost ? origin : '*';
   
   // Log for debugging
   if (origin && !allowedOrigins.includes(origin)) {
@@ -411,11 +760,15 @@ async function saveUserByEmail(env, email, userData) {
             
             // Update subscription items
             if (subscription.items && Array.isArray(subscription.items)) {
+              // Get billing_period and renewal_date from subscription
+              const billingPeriod = subscription.billingPeriod || subscription.billing_period || null;
+              const renewalDate = subscription.current_period_end || null;
+              
               for (const item of subscription.items) {
                 await env.DB.prepare(
                   `INSERT OR REPLACE INTO subscription_items 
-                   (subscription_id, item_id, site_domain, price_id, quantity, status, created_at, updated_at, removed_at) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                   (subscription_id, item_id, site_domain, price_id, quantity, status, billing_period, renewal_date, created_at, updated_at, removed_at) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
                 ).bind(
                   subscription.subscriptionId,
                   item.item_id,
@@ -423,6 +776,8 @@ async function saveUserByEmail(env, email, userData) {
                   item.price || item.price_id,
                   item.quantity || 1,
                   item.status || 'active',
+                  billingPeriod,
+                  renewalDate,
                   item.created_at || timestamp,
                   timestamp,
                   item.removed_at || null
@@ -439,6 +794,13 @@ async function saveUserByEmail(env, email, userData) {
     // If not provided, don't touch the database (preserves existing pending sites)
     // IMPORTANT: The database is the source of truth - we sync FROM database TO user object, not the other way around
     // So when saving, we only update the database if userData.pendingSites is explicitly set
+    console.log(`[saveUserByEmail] Checking pendingSites:`, {
+      hasPendingSites: userData.pendingSites !== undefined,
+      isArray: Array.isArray(userData.pendingSites),
+      length: userData.pendingSites?.length,
+      pendingSites: userData.pendingSites
+    });
+    
     if (userData.pendingSites !== undefined && Array.isArray(userData.pendingSites)) {
       // Get current pending sites from database (source of truth)
       const currentPendingSitesRes = await env.DB.prepare(
@@ -452,12 +814,46 @@ async function saveUserByEmail(env, email, userData) {
         });
       }
       
+      console.log(`[saveUserByEmail] Current pending sites in DB: ${currentPendingSites.size}`);
+      
       // Get user object pending sites
       const userPendingSites = new Set();
       userData.pendingSites.forEach(ps => {
         const siteName = (ps.site || ps.site_domain || '').toLowerCase().trim();
         if (siteName) {
           userPendingSites.add(siteName);
+        }
+      });
+      
+      console.log(`[saveUserByEmail] User pending sites: ${userPendingSites.size}`);
+      
+      // Flatten pendingSites array to handle nested structures
+      const flattenedPendingSites = [];
+      userData.pendingSites.forEach(ps => {
+        // Handle nested arrays or objects with pendingSites property
+        if (Array.isArray(ps)) {
+          // If element is an array, extract items
+          ps.forEach(item => {
+            if (item && typeof item === 'object') {
+              flattenedPendingSites.push(item);
+            } else if (typeof item === 'string') {
+              // If it's just a string, convert to object
+              flattenedPendingSites.push({ site: item, site_domain: item });
+            }
+          });
+        } else if (ps && typeof ps === 'object' && ps.pendingSites) {
+          // If object has pendingSites property, extract it
+          if (Array.isArray(ps.pendingSites)) {
+            flattenedPendingSites.push(...ps.pendingSites);
+          } else {
+            flattenedPendingSites.push(ps.pendingSites);
+          }
+        } else if (ps && typeof ps === 'object') {
+          // Normal object, add as is
+          flattenedPendingSites.push(ps);
+        } else if (typeof ps === 'string') {
+          // If it's just a string, convert to object
+          flattenedPendingSites.push({ site: ps, site_domain: ps });
         }
       });
       
@@ -470,37 +866,56 @@ async function saveUserByEmail(env, email, userData) {
       });
       
       // Find sites to insert (in user object but not in database)
+      // Use flattened array to avoid nested structures
       const sitesToInsert = [];
-      userData.pendingSites.forEach(ps => {
+      flattenedPendingSites.forEach(ps => {
         const siteName = (ps.site || ps.site_domain || '').toLowerCase().trim();
         if (siteName && !currentPendingSites.has(siteName)) {
           sitesToInsert.push(ps);
         }
       });
       
+      console.log(`[saveUserByEmail] Sites to insert: ${sitesToInsert.length}, Sites to delete: ${sitesToDelete.length}`);
+      
       // Delete sites that are in database but not in user object
       for (const siteToDelete of sitesToDelete) {
-        await env.DB.prepare(
+        const deleteResult = await env.DB.prepare(
           'DELETE FROM pending_sites WHERE user_email = ? AND LOWER(TRIM(site_domain)) = ?'
         ).bind(normalizedEmail, siteToDelete).run();
+        console.log(`[saveUserByEmail] 🗑️ Deleted pending site: ${siteToDelete}`, deleteResult.success ? '✅' : '❌');
       }
       
       // Insert sites that are in user object but not in database
       for (const pendingSite of sitesToInsert) {
-        await env.DB.prepare(
-          'INSERT INTO pending_sites (user_email, subscription_id, site_domain, price_id, quantity, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-        ).bind(
-          normalizedEmail,
-          pendingSite.subscription_id || null,
-          pendingSite.site || pendingSite.site_domain,
-          pendingSite.price || pendingSite.price_id,
-          pendingSite.quantity || 1,
-          pendingSite.created_at || timestamp
-        ).run();
+        const siteName = pendingSite.site || pendingSite.site_domain;
+        const sitePrice = pendingSite.price || pendingSite.price_id;
+        try {
+          const insertResult = await env.DB.prepare(
+            'INSERT INTO pending_sites (user_email, subscription_id, site_domain, price_id, quantity, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+          ).bind(
+            normalizedEmail,
+            pendingSite.subscription_id || null,
+            siteName,
+            sitePrice,
+            pendingSite.quantity || 1,
+            pendingSite.created_at || timestamp
+          ).run();
+          
+          if (insertResult.success) {
+            console.log(`[saveUserByEmail] ✅ Inserted pending site: ${siteName} with price: ${sitePrice}`);
+          } else {
+            console.error(`[saveUserByEmail] ❌ Failed to insert pending site: ${siteName}`, insertResult);
+          }
+        } catch (insertErr) {
+          console.error(`[saveUserByEmail] ❌ Error inserting pending site ${siteName}:`, insertErr);
+        }
       }
       
       if (sitesToDelete.length > 0 || sitesToInsert.length > 0) {
+        console.log(`[saveUserByEmail] ✅ Pending sites sync complete: ${sitesToInsert.length} inserted, ${sitesToDelete.length} deleted`);
       }
+    } else {
+      console.log(`[saveUserByEmail] ⚠️ Skipping pending sites sync: pendingSites is ${userData.pendingSites === undefined ? 'undefined' : 'not an array'}`);
     }
     // If userData.pendingSites is undefined, don't modify the database - keep existing pending sites
     
@@ -511,9 +926,17 @@ async function saveUserByEmail(env, email, userData) {
 }
 
 async function addOrUpdateCustomerInUser(env, email, customerId, subscriptionId, items, billingPeriod = null) {
+  console.log(`[addOrUpdateCustomerInUser] 🔍 Starting database update for subscription...`);
+  console.log(`[addOrUpdateCustomerInUser]   - Email: ${email}`);
+  console.log(`[addOrUpdateCustomerInUser]   - Customer ID: ${customerId}`);
+  console.log(`[addOrUpdateCustomerInUser]   - Subscription ID: ${subscriptionId}`);
+  console.log(`[addOrUpdateCustomerInUser]   - Items count: ${items.length}`);
+  console.log(`[addOrUpdateCustomerInUser]   - Billing period: ${billingPeriod || 'not set'}`);
+  
   let user = await getUserByEmail(env, email);
   
   if (!user) {
+    console.log(`[addOrUpdateCustomerInUser]   - Creating new user structure...`);
     // Create new user structure with email as primary key
     user = {
       email: email.toLowerCase().trim(),
@@ -523,22 +946,28 @@ async function addOrUpdateCustomerInUser(env, email, customerId, subscriptionId,
       created_at: Math.floor(Date.now() / 1000),
       updated_at: Math.floor(Date.now() / 1000)
     };
+  } else {
+    console.log(`[addOrUpdateCustomerInUser]   - User exists with ${user.customers?.length || 0} customer(s)`);
   }
   
   // Find or create customer
   let customer = user.customers.find(c => c.customerId === customerId);
   if (!customer) {
+    console.log(`[addOrUpdateCustomerInUser]   - Creating new customer: ${customerId}`);
     customer = {
       customerId: customerId,
       subscriptions: [],
       created_at: Math.floor(Date.now() / 1000)
     };
     user.customers.push(customer);
+  } else {
+    console.log(`[addOrUpdateCustomerInUser]   - Customer exists with ${customer.subscriptions?.length || 0} subscription(s)`);
   }
   
   // Find or create subscription
   let subscription = customer.subscriptions.find(s => s.subscriptionId === subscriptionId);
   if (!subscription) {
+    console.log(`[addOrUpdateCustomerInUser]   - Creating new subscription: ${subscriptionId}`);
     subscription = {
       subscriptionId: subscriptionId,
       status: 'active',
@@ -548,29 +977,40 @@ async function addOrUpdateCustomerInUser(env, email, customerId, subscriptionId,
     };
     customer.subscriptions.push(subscription);
   } else {
+    console.log(`[addOrUpdateCustomerInUser]   - Subscription exists with ${subscription.items?.length || 0} item(s)`);
     // Update billing period if provided and not already set
     if (billingPeriod && !subscription.billingPeriod) {
+      console.log(`[addOrUpdateCustomerInUser]   - Updating billing period: ${billingPeriod}`);
       subscription.billingPeriod = billingPeriod;
     }
   }
   
   // Add/update items (merge with existing, avoid duplicates)
-  items.forEach(item => {
+  let newItemsCount = 0;
+  let updatedItemsCount = 0;
+  items.forEach((item, idx) => {
     const existingItem = subscription.items.find(i => i.item_id === item.item_id);
     if (existingItem) {
       // Update existing item
+      console.log(`[addOrUpdateCustomerInUser]   - Updating existing item ${idx + 1}: ${item.item_id} (site: ${item.site || 'N/A'})`);
       Object.assign(existingItem, item);
+      updatedItemsCount++;
     } else {
       // Add new item
+      console.log(`[addOrUpdateCustomerInUser]   - Adding new item ${idx + 1}: ${item.item_id} (site: ${item.site || 'N/A'})`);
       subscription.items.push(item);
+      newItemsCount++;
     }
   });
+  console.log(`[addOrUpdateCustomerInUser]   - Items summary: ${newItemsCount} new, ${updatedItemsCount} updated`);
   
   // Update subscription status and timestamp
   subscription.status = 'active';
   subscription.updated_at = Math.floor(Date.now() / 1000);
   
+  console.log(`[addOrUpdateCustomerInUser]   - Saving user object to database...`);
   await saveUserByEmail(env, email, user);
+  console.log(`[addOrUpdateCustomerInUser] ✅ Database update complete for subscription ${subscriptionId}`);
   return user;
 }
 
@@ -691,6 +1131,35 @@ async function saveOrUpdateSiteInDB(env, siteData) {
     console.error('Error saving site to database:', error);
     // Don't throw - database save failure shouldn't break the flow
   }
+}
+
+/**
+ * Helper function to extract billing_period from Stripe subscription
+ * @param {Object} subscription - Stripe subscription object
+ * @returns {string|null} - 'monthly', 'yearly', 'weekly', 'daily', or null
+ */
+function extractBillingPeriodFromStripe(subscription) {
+  if (!subscription || !subscription.items || !subscription.items.data || subscription.items.data.length === 0) {
+    return null;
+  }
+  
+  const firstItem = subscription.items.data[0];
+  if (firstItem.price && firstItem.price.recurring) {
+    const interval = firstItem.price.recurring.interval;
+    if (interval === 'month') {
+      return 'monthly';
+    } else if (interval === 'year') {
+      return 'yearly';
+    } else if (interval === 'week') {
+      return 'weekly';
+    } else if (interval === 'day') {
+      return 'daily';
+    } else {
+      return interval; // fallback to raw value
+    }
+  }
+  
+  return null;
 }
 
 // Helper function to fetch license for a specific site
@@ -863,6 +1332,95 @@ async function sendEmail(to, subject, html, env) {
 }
 
 // Fetch customer email from Stripe customer object
+/**
+ * Get price ID by billing period (monthly or yearly)
+ * Checks database first, then falls back to environment variables
+ */
+// Get price_id and product_id from price_config table (optimized - no Stripe API call)
+async function getPriceConfigByBillingPeriod(env, billingPeriod) {
+  try {
+    // Normalize billing period
+    const normalizedPeriod = billingPeriod?.toLowerCase().trim();
+    if (!normalizedPeriod || (normalizedPeriod !== 'monthly' && normalizedPeriod !== 'yearly')) {
+      console.warn(`[getPriceConfigByBillingPeriod] Invalid billing period: ${billingPeriod}`);
+      return null;
+    }
+    
+    // Map to database price_type format
+    const priceType = normalizedPeriod === 'monthly' ? 'monthly' : 'yearly';
+    
+    // Try database first
+    if (env.DB) {
+      try {
+        // Get all available columns from price_config table
+        // This handles cases where some columns might not exist yet
+        const result = await env.DB.prepare(
+          'SELECT * FROM price_config WHERE price_type = ? AND is_active = 1 LIMIT 1'
+        ).bind(priceType).first();
+        
+        if (result) {
+          // Extract available fields (handle missing columns gracefully)
+          const config = {
+            price_id: result.price_id || null,
+            product_id: result.product_id || null,
+            unit_amount: result.unit_amount || null,
+            currency: result.currency || 'usd',
+            discount_allowance: result.discount_allowance || null,
+            discount_type: result.discount_type || null,
+            coupon_code: result.coupon_code || null
+          };
+          
+          // If price_id exists, return the config
+          if (config.price_id) {
+            console.log(`[getPriceConfigByBillingPeriod] Found config from database for ${priceType}:`, config);
+            return config;
+              } else {
+            console.warn(`[getPriceConfigByBillingPeriod] Record found for ${priceType} but price_id is missing`);
+          }
+        }
+      } catch (dbError) {
+        console.warn(`[getPriceConfigByBillingPeriod] Database query failed:`, dbError);
+        // If error is due to missing columns, try with basic query
+        try {
+          const basicResult = await env.DB.prepare(
+            'SELECT price_id FROM price_config WHERE price_type = ? AND is_active = 1 LIMIT 1'
+          ).bind(priceType).first();
+          
+          if (basicResult && basicResult.price_id) {
+            console.log(`[getPriceConfigByBillingPeriod] Found price_id using basic query: ${basicResult.price_id}`);
+            return {
+              price_id: basicResult.price_id,
+              product_id: null,
+              unit_amount: null,
+              currency: 'usd'
+            };
+          }
+        } catch (basicError) {
+          console.warn(`[getPriceConfigByBillingPeriod] Basic query also failed:`, basicError);
+        }
+      }
+    }
+    
+    // Fallback to environment variables
+    const fallbackPriceId = env.LICENSE_PRICE_ID || env.DEFAULT_PRICE_ID;
+    if (fallbackPriceId) {
+      console.log(`[getPriceConfigByBillingPeriod] Using fallback price_id from environment: ${fallbackPriceId}`);
+      return { price_id: fallbackPriceId, product_id: null, unit_amount: null };
+    }
+    
+    return null;
+  } catch (error) {
+    console.error(`[getPriceConfigByBillingPeriod] Error:`, error);
+    return null;
+  }
+}
+
+// Legacy function for backward compatibility
+async function getPriceIdByBillingPeriod(env, billingPeriod) {
+  const config = await getPriceConfigByBillingPeriod(env, billingPeriod);
+  return config ? config.price_id : null;
+}
+
 async function getCustomerEmail(env, customerId) {
   try {
     const customerRes = await stripeFetch(env, `/customers/${customerId}`);
@@ -892,6 +1450,219 @@ function createSessionCookie_UNUSED(token, maxAge = 60 * 60 * 24 * 7) {
  * @param {Object} paymentIntent - Stripe payment intent object (optional, for payment mode)
  * @returns {boolean} - true if payment is verified as successful, false otherwise
  */
+// Helper function to format site name with https:// prefix if needed
+function formatSiteName(siteName) {
+  if (!siteName) return null;
+  const trimmed = siteName.trim();
+  if (!trimmed) return null;
+  
+  // If already has http:// or https://, return as is
+  if (trimmed.toLowerCase().startsWith('http://') || trimmed.toLowerCase().startsWith('https://')) {
+    return trimmed;
+  }
+  
+  // Otherwise, add https://
+  return `https://${trimmed}`;
+}
+
+/**
+ * Log Stripe webhook events to database for debugging and tracking
+ * Stores logs in stripe_logs table in D1 database
+ * @param {Object} env - Environment variables
+ * @param {Object} event - Stripe webhook event object
+ * @param {string} subscriptionId - Subscription ID (if available)
+ * @param {string} customerId - Customer ID (if available)
+ * @param {Object} additionalData - Additional data to log (status changes, etc.)
+ */
+async function logStripeEvent(env, event, subscriptionId = null, customerId = null, additionalData = {}) {
+  try {
+    if (!env.DB) {
+      console.warn('[Stripe Log] Database not configured, skipping log storage');
+      return;
+    }
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const date = new Date(timestamp * 1000).toISOString().split('T')[0]; // YYYY-MM-DD
+    const eventId = event.id || `evt_${timestamp}`;
+    const eventType = event.type || 'unknown';
+    
+    // Extract subscription ID from event if not provided
+    if (!subscriptionId && event.data?.object) {
+      subscriptionId = event.data.object.subscription || 
+                       event.data.object.id || 
+                       event.data.object.subscription_id || 
+                       null;
+    }
+    
+    // Extract customer ID from event if not provided
+    if (!customerId && event.data?.object) {
+      customerId = event.data.object.customer || 
+                   event.data.object.customer_id || 
+                   null;
+    }
+
+    // Prepare event data for storage (store as JSON string)
+    const eventData = {
+      id: event.id,
+      type: event.type,
+      created: event.created,
+      livemode: event.livemode,
+      object: event.data?.object ? {
+        id: event.data.object.id,
+        object: event.data.object.object,
+        status: event.data.object.status,
+        cancel_at_period_end: event.data.object.cancel_at_period_end,
+        canceled_at: event.data.object.canceled_at,
+        current_period_end: event.data.object.current_period_end,
+        current_period_start: event.data.object.current_period_start,
+      } : null
+    };
+
+    // Store additional data as JSON string
+    const additionalDataJson = JSON.stringify(additionalData);
+    const eventDataJson = JSON.stringify(eventData);
+
+    // Insert into stripe_logs table
+    // Table schema: id (AUTOINCREMENT), timestamp, date, event_id, event_type, subscription_id, customer_id, event_data (TEXT/JSON), additional_data (TEXT/JSON), created_at
+    await env.DB.prepare(
+      `INSERT INTO stripe_logs 
+       (timestamp, date, event_id, event_type, subscription_id, customer_id, event_data, additional_data, created_at) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      timestamp,
+      date,
+      eventId,
+      eventType,
+      subscriptionId,
+      customerId,
+      eventDataJson,
+      additionalDataJson,
+      timestamp
+    ).run();
+    
+    console.log(`[Stripe Log] ✅ Logged event ${eventType} for subscription ${subscriptionId || 'N/A'} at ${date} ${new Date(timestamp * 1000).toISOString()}`);
+  } catch (error) {
+    console.error('[Stripe Log] ❌ Error logging Stripe event:', error);
+    // Don't throw - logging failures shouldn't break webhook processing
+    // If table doesn't exist, log warning but continue
+    if (error.message && error.message.includes('no such table: stripe_logs')) {
+      console.warn('[Stripe Log] ⚠️ stripe_logs table does not exist. Please run the migration to create it.');
+    }
+  }
+}
+
+// Helper function to save subscription data to KV storage
+async function saveSubscriptionToKV(env, customerId, subscriptionId, email, siteName, subscriptionStatus = 'complete', paymentStatus = 'paid', cancelAtPeriodEnd = false) {
+  try {
+    if (!env.ACTIVE_SITES_CONSENTBIT || !env.SUBSCRIPTION_CONSENTBIT) {
+      console.warn('[KV] KV namespaces not configured, skipping KV storage');
+      return;
+    }
+    
+    const now = new Date().toISOString();
+    const formattedSiteName = formatSiteName(siteName);
+    
+    if (!formattedSiteName) {
+      console.warn('[KV] No site name provided, skipping KV storage');
+      return;
+    }
+    
+    // Save to ACTIVE_SITES_CONSENTBIT with fixed ID: 66c7aa5c7fcb4c2a8dfec5463e86a293
+    const activeSitesData = {
+      active: subscriptionStatus === 'complete' || subscriptionStatus === 'active',
+      subscriptionId: subscriptionId,
+      customerId: customerId,
+      email: email,
+      status: subscriptionStatus,
+      lastUpdated: now,
+      cancelAtPeriodEnd: cancelAtPeriodEnd
+    };
+    
+    await env.ACTIVE_SITES_CONSENTBIT.put('66c7aa5c7fcb4c2a8dfec5463e86a293', JSON.stringify(activeSitesData));
+    console.log('[KV] ✅ Saved to ACTIVE_SITES_CONSENTBIT with ID: 66c7aa5c7fcb4c2a8dfec5463e86a293');
+    
+    // Save to SUBSCRIPTION_CONSENTBIT with key: customerId-subscriptionId
+    const subscriptionKey = `${customerId}-${subscriptionId}`;
+    const subscriptionData = {
+      email: email,
+      connectDomain: formattedSiteName,
+      isSubscribed: subscriptionStatus === 'complete' || subscriptionStatus === 'active',
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: subscriptionId,
+      subscriptionStatus: subscriptionStatus,
+      paymentStatus: paymentStatus,
+      created: now,
+      lastUpdated: now
+    };
+    
+    await env.SUBSCRIPTION_CONSENTBIT.put(subscriptionKey, JSON.stringify(subscriptionData));
+    console.log(`[KV] ✅ Saved to SUBSCRIPTION_CONSENTBIT with key: ${subscriptionKey}`);
+    
+  } catch (error) {
+    console.error('[KV] ❌ Error saving to KV storage:', error);
+    // Don't throw - KV storage is optional, don't fail the main operation
+  }
+}
+
+// Helper function to save license key data to KV storage (for quantity purchases)
+async function saveLicenseKeyToKV(env, licenseKey, customerId, subscriptionId, email, subscriptionStatus = 'complete', cancelAtPeriodEnd = false, siteName = null) {
+  try {
+    if (!env.ACTIVE_SITES_CONSENTBIT) {
+      console.warn('[KV] ACTIVE_SITES_CONSENTBIT namespace not configured, skipping KV storage');
+      return;
+    }
+    
+    const now = new Date().toISOString();
+    
+    const activeSitesData = {
+      active: subscriptionStatus === 'complete' || subscriptionStatus === 'active',
+      subscriptionId: subscriptionId,
+      customerId: customerId,
+      email: email,
+      status: subscriptionStatus,
+      lastUpdated: now,
+      cancelAtPeriodEnd: cancelAtPeriodEnd
+    };
+    
+    // If site name is provided (license key is activated), use connectDomain as the KV key
+    if (siteName) {
+      const formattedSiteName = formatSiteName(siteName);
+      if (formattedSiteName) {
+        activeSitesData.connectDomain = formattedSiteName;
+        
+        // Use connectDomain as the KV key instead of license key
+        await env.ACTIVE_SITES_CONSENTBIT.put(formattedSiteName, JSON.stringify(activeSitesData));
+        console.log(`[KV] ✅ Saved license key to ACTIVE_SITES_CONSENTBIT with key: ${formattedSiteName} (connectDomain)`);
+        
+        // Delete old KV entry if it was keyed by license key (for backward compatibility)
+        // Note: This is a safety check - the activate-license endpoint also deletes old entries
+        try {
+          const oldEntry = await env.ACTIVE_SITES_CONSENTBIT.get(licenseKey);
+          if (oldEntry) {
+            await env.ACTIVE_SITES_CONSENTBIT.delete(licenseKey);
+            console.log(`[KV] 🗑️ Deleted old KV entry keyed by license key: ${licenseKey}`);
+          }
+        } catch (deleteErr) {
+          // Entry might not exist or already deleted - that's okay
+          // Non-critical, continue
+        }
+      } else {
+        // If formatting failed, fall back to license key as the key
+        await env.ACTIVE_SITES_CONSENTBIT.put(licenseKey, JSON.stringify(activeSitesData));
+        console.log(`[KV] ✅ Saved license key to ACTIVE_SITES_CONSENTBIT with key: ${licenseKey} (fallback)`);
+      }
+    } else {
+      // If no site name, use license key as the key (license not activated yet)
+      await env.ACTIVE_SITES_CONSENTBIT.put(licenseKey, JSON.stringify(activeSitesData));
+      console.log(`[KV] ✅ Saved license key to ACTIVE_SITES_CONSENTBIT with key: ${licenseKey} (not activated)`);
+    }
+    
+  } catch (error) {
+    console.error('[KV] ❌ Error saving license key to KV storage:', error);
+    // Don't throw - KV storage is optional, don't fail the main operation
+  }
+}
+
 function verifyPaymentSuccess(session, paymentIntent = null) {
   // Verify checkout session payment status
   if (session.payment_status !== 'paid') {
@@ -940,6 +1711,20 @@ async function addToSubscriptionQueue(env, queueData) {
   const timestamp = Math.floor(Date.now() / 1000);
   
   try {
+    // CRITICAL: Check if a queue item with the same payment_intent_id and license_key already exists
+    // This prevents duplicate queue entries if the webhook is called multiple times
+    const existingQueueItem = await env.DB.prepare(
+      `SELECT queue_id, status FROM subscription_queue 
+       WHERE payment_intent_id = ? AND license_key = ? 
+       AND status IN ('pending', 'processing', 'completed')
+       LIMIT 1`
+    ).bind(paymentIntentId, licenseKey).first();
+    
+    if (existingQueueItem) {
+      console.log(`[QUEUE] ⚠️ Queue item already exists for payment_intent_id=${paymentIntentId}, license_key=${licenseKey} (status: ${existingQueueItem.status}, queue_id: ${existingQueueItem.queue_id}). Skipping duplicate entry.`);
+      return { success: true, queueId: existingQueueItem.queue_id, skipped: true, reason: 'duplicate' };
+    }
+    
     await env.DB.prepare(
       `INSERT INTO subscription_queue 
        (queue_id, customer_id, user_email, payment_intent_id, price_id, license_key, quantity, trial_end, status, created_at, updated_at)
@@ -974,44 +1759,119 @@ async function processQueueItem(env, queueItem) {
     user_email,
     payment_intent_id,
     price_id,
-    license_key,
+    license_key: originalLicenseKey,
     trial_end
   } = queueItem;
   
-  try {
-    // Check if subscription already exists for this license (may have been created immediately)
-    let existingSubscriptionId = null;
+  // STEP: Replace temporary license key with real unique key if needed
+  let license_key = originalLicenseKey;
+  if (isTemporaryLicenseKey(originalLicenseKey)) {
+    console.log(`[USE CASE 3 - QUEUE] 🔄 Replacing temporary license key "${originalLicenseKey}" with real unique key...`);
+    license_key = await generateUniqueLicenseKey(env);
+    console.log(`[USE CASE 3 - QUEUE] ✅ Replaced temporary key "${originalLicenseKey}" with real key "${license_key}"`);
+    
+    // Update the queue item with the real license key
     try {
+      const timestamp = Math.floor(Date.now() / 1000);
+      await env.DB.prepare(
+        `UPDATE subscription_queue SET license_key = ?, updated_at = ? WHERE queue_id = ?`
+      ).bind(license_key, timestamp, queue_id).run();
+      console.log(`[USE CASE 3 - QUEUE] ✅ Updated queue item with real license key`);
+    } catch (updateErr) {
+      console.warn(`[USE CASE 3 - QUEUE] ⚠️ Could not update queue item with real license key:`, updateErr);
+      // Continue anyway - we'll use the real key for subscription creation
+    }
+  }
+  
+  console.log(`[USE CASE 3 - QUEUE] 🔍 Processing queue item for license: ${license_key}`);
+  console.log(`[USE CASE 3 - QUEUE] 📋 Queue Details:`, {
+    queue_id,
+    customer_id,
+    user_email,
+    payment_intent_id,
+    price_id,
+    license_key,
+    original_license_key: originalLicenseKey !== license_key ? originalLicenseKey : null,
+    trial_end: trial_end ? new Date(trial_end * 1000).toISOString() : null
+  });
+  
+  try {
+    // CRITICAL: Check if subscription already exists for this license (may have been created immediately)
+    // Also check if another queue item for this license_key has already been processed
+    // This prevents race conditions when multiple queue items exist for the same license_key
+    let existingSubscriptionId = null;
+    let existingItemId = null;
+    try {
+      // First check: Look for existing license with subscription in licenses table
       const existingLicense = await env.DB.prepare(
-        `SELECT subscription_id FROM licenses WHERE license_key = ? AND subscription_id IS NOT NULL`
+        `SELECT subscription_id, item_id FROM licenses WHERE license_key = ? AND subscription_id IS NOT NULL LIMIT 1`
       ).bind(license_key).first();
       
       if (existingLicense && existingLicense.subscription_id) {
         existingSubscriptionId = existingLicense.subscription_id;
+        existingItemId = existingLicense.item_id || null;
+        console.log(`[USE CASE 3 - QUEUE] ✅ Subscription already exists for license ${license_key}: ${existingSubscriptionId}`);
+      } else {
+        // Second check: Look for completed queue items for this license_key (to catch race conditions)
+        const completedQueueItem = await env.DB.prepare(
+          `SELECT subscription_id, item_id FROM subscription_queue 
+           WHERE license_key = ? AND status = 'completed' AND subscription_id IS NOT NULL
+           ORDER BY processed_at DESC LIMIT 1`
+        ).bind(license_key).first();
+        
+        if (completedQueueItem && completedQueueItem.subscription_id) {
+          existingSubscriptionId = completedQueueItem.subscription_id;
+          existingItemId = completedQueueItem.item_id || null;
+          console.log(`[USE CASE 3 - QUEUE] ✅ Another queue item for license ${license_key} already completed with subscription: ${existingSubscriptionId}`);
+        } else {
+          console.log(`[USE CASE 3 - QUEUE] ℹ️ No existing subscription found for license ${license_key}, creating new one`);
+        }
       }
     } catch (checkErr) {
-      console.warn(`[QUEUE] ⚠️ Could not check for existing subscription:`, checkErr);
+      console.warn(`[USE CASE 3 - QUEUE] ⚠️ Could not check for existing subscription:`, checkErr);
     }
     
     // If subscription already exists, mark queue item as completed and return
     if (existingSubscriptionId) {
       const timestamp = Math.floor(Date.now() / 1000);
-      const existingLicense = await env.DB.prepare(
-        `SELECT item_id FROM licenses WHERE license_key = ? AND subscription_id = ?`
-      ).bind(license_key, existingSubscriptionId).first();
       
-      const itemId = existingLicense?.item_id || null;
-      
+      // OPTIMIZATION: Single UPDATE query instead of separate SELECT + UPDATE
       await env.DB.prepare(
         `UPDATE subscription_queue 
          SET status = 'completed', subscription_id = ?, item_id = ?, processed_at = ?, updated_at = ?
          WHERE queue_id = ?`
-      ).bind(existingSubscriptionId, itemId, timestamp, timestamp, queue_id).run();
+      ).bind(existingSubscriptionId, existingItemId, timestamp, timestamp, queue_id).run();
       
-      return { success: true, subscriptionId: existingSubscriptionId, itemId, skipped: true };
+      console.log(`[USE CASE 3 - QUEUE] ✅ Queue item ${queue_id} marked as completed (subscription already existed)`);
+      return { success: true, subscriptionId: existingSubscriptionId, itemId: existingItemId, skipped: true };
+    }
+    
+    // CRITICAL: Final duplicate check right before creating subscription
+    // Double-check that no subscription was created while we were processing
+    // This is a last line of defense against race conditions
+    try {
+      const finalCheck = await env.DB.prepare(
+        `SELECT subscription_id, item_id FROM licenses WHERE license_key = ? AND subscription_id IS NOT NULL LIMIT 1`
+      ).bind(license_key).first();
+      
+      if (finalCheck && finalCheck.subscription_id) {
+        console.log(`[USE CASE 3 - QUEUE] ⚠️ Subscription was created for license ${license_key} while processing (race condition detected): ${finalCheck.subscription_id}`);
+        // Mark queue item as completed with existing subscription
+        const timestamp = Math.floor(Date.now() / 1000);
+        await env.DB.prepare(
+          `UPDATE subscription_queue 
+           SET status = 'completed', subscription_id = ?, item_id = ?, processed_at = ?, updated_at = ?
+           WHERE queue_id = ?`
+        ).bind(finalCheck.subscription_id, finalCheck.item_id || null, timestamp, timestamp, queue_id).run();
+        
+        return { success: true, subscriptionId: finalCheck.subscription_id, itemId: finalCheck.item_id || null, skipped: true, reason: 'duplicate_detected' };
+      }
+    } catch (finalCheckErr) {
+      console.warn(`[USE CASE 3 - QUEUE] ⚠️ Final duplicate check failed (continuing anyway):`, finalCheckErr);
     }
     
     // Create subscription
+    console.log(`[USE CASE 3 - QUEUE] 🚀 Creating individual subscription for license ${license_key}...`);
     const createSubRes = await stripeFetch(env, '/subscriptions', 'POST', {
       'customer': customer_id,
       'items[0][price]': price_id,
@@ -1029,21 +1889,63 @@ async function processQueueItem(env, queueItem) {
       const subscriptionId = subscription.id;
       const itemId = subscription.items?.data?.[0]?.id || null;
       
+      console.log(`[USE CASE 3 - QUEUE] ✅ Individual subscription created successfully!`);
+      console.log(`[USE CASE 3 - QUEUE] 📊 Subscription Details:`, {
+        license_key,
+        subscription_id: subscriptionId,
+        item_id: itemId,
+        customer_id,
+        status: subscription.status,
+        current_period_start: subscription.current_period_start ? new Date(subscription.current_period_start * 1000).toISOString() : null,
+        current_period_end: subscription.current_period_end ? new Date(subscription.current_period_end * 1000).toISOString() : null,
+        trial_end: subscription.trial_end ? new Date(subscription.trial_end * 1000).toISOString() : null
+      });
+      
       const timestamp = Math.floor(Date.now() / 1000);
       
-      // Update queue item as completed
-      await env.DB.prepare(
-        `UPDATE subscription_queue 
-         SET status = 'completed', subscription_id = ?, item_id = ?, processed_at = ?, updated_at = ?
-         WHERE queue_id = ?`
-      ).bind(subscriptionId, itemId, timestamp, timestamp, queue_id).run();
+      // Fetch billing_period and renewal_date from Stripe subscription
+      let billingPeriod = null;
+      // Stripe automatically calculates current_period_end correctly:
+      // - If trial_end exists: current_period_end = trial_end + billing_interval
+      // - If no trial: current_period_end = now + billing_interval
+      // So we can use current_period_end directly - it's already the correct renewal date
+      let renewalDate = subscription.current_period_end || null;
+      
+      // Get billing period from subscription items
+      if (subscription.items && subscription.items.data && subscription.items.data.length > 0) {
+        const firstItem = subscription.items.data[0];
+        if (firstItem.price && firstItem.price.recurring) {
+          const interval = firstItem.price.recurring.interval;
+          if (interval === 'month') {
+            billingPeriod = 'monthly';
+          } else if (interval === 'year') {
+            billingPeriod = 'yearly';
+          } else if (interval === 'week') {
+            billingPeriod = 'weekly';
+          } else if (interval === 'day') {
+            billingPeriod = 'daily';
+          } else {
+            billingPeriod = interval;
+          }
+          
+          // Stripe sets current_period_end = billing_cycle_anchor + billing_interval
+          // When trial_end is set, billing_cycle_anchor = trial_end
+          // So current_period_end = trial_end + billing_interval (already correct!)
+          // No need to calculate manually - use Stripe's value directly
+        }
+      }
+      
+      // CRITICAL: Save license and subscription records FIRST before marking as completed
+      // If database save fails, we should retry, not mark as completed
+      let licenseSaved = false;
+      let subscriptionSaved = false;
       
       // Save license to database (for dashboard display)
       try {
-        await env.DB.prepare(
+        const insertResult = await env.DB.prepare(
           `INSERT INTO licenses 
-           (license_key, customer_id, subscription_id, item_id, site_domain, used_site_domain, status, purchase_type, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           (license_key, customer_id, subscription_id, item_id, site_domain, used_site_domain, status, purchase_type, billing_period, renewal_date, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           license_key,
           customer_id,
@@ -1053,21 +1955,63 @@ async function processQueueItem(env, queueItem) {
           null,
           'active',
           'quantity',
+          billingPeriod,
+          renewalDate,
           timestamp,
           timestamp
         ).run();
+        
+        if (insertResult.success) {
+          licenseSaved = true;
+          console.log(`[USE CASE 3 - QUEUE] ✅ License saved to database:`, {
+            license_key,
+            subscription_id: subscriptionId,
+            item_id: itemId,
+            customer_id,
+            purchase_type: 'quantity',
+            billing_period: billingPeriod,
+            renewal_date: renewalDate ? new Date(renewalDate * 1000).toISOString() : null,
+            created_at: new Date(timestamp * 1000).toISOString()
+          });
+          
+          // Verify the license was saved correctly
+          const verifyLicense = await env.DB.prepare(
+            `SELECT license_key, subscription_id, item_id, customer_id, purchase_type, billing_period, renewal_date 
+             FROM licenses WHERE license_key = ? LIMIT 1`
+          ).bind(license_key).first();
+          
+          if (verifyLicense) {
+            console.log(`[USE CASE 3 - QUEUE] ✅ Verified license in database:`, {
+              license_key: verifyLicense.license_key,
+              subscription_id: verifyLicense.subscription_id,
+              item_id: verifyLicense.item_id,
+              customer_id: verifyLicense.customer_id,
+              purchase_type: verifyLicense.purchase_type,
+              billing_period: verifyLicense.billing_period,
+              renewal_date: verifyLicense.renewal_date ? new Date(verifyLicense.renewal_date * 1000).toISOString() : null
+            });
+        } else {
+            console.error(`[USE CASE 3 - QUEUE] ❌ License verification failed - license not found in database after insert!`);
+          }
+        } else {
+          console.error(`[USE CASE 3 - QUEUE] ❌ Database insert returned success=false for license ${license_key}`);
+          throw new Error(`Database insert failed for license ${license_key}`);
+        }
       } catch (licenseErr) {
         if (licenseErr.message && licenseErr.message.includes('UNIQUE constraint')) {
-          console.warn(`[QUEUE] ⚠️ License ${license_key} already exists in database, skipping`);
+          console.warn(`[USE CASE 3 - QUEUE] ⚠️ License ${license_key} already exists in database, skipping`);
+          licenseSaved = true; // Already exists, consider it saved
         } else {
-          console.error(`[QUEUE] ❌ Error saving license ${license_key}:`, licenseErr);
-          // Don't fail the whole operation if license save fails - subscription was created successfully
+          console.error(`[USE CASE 3 - QUEUE] ❌ Error saving license ${license_key}:`, licenseErr);
+          // If license save fails, throw error to trigger retry
+          throw new Error(`Failed to save license to database: ${licenseErr.message || String(licenseErr)}`);
         }
       }
       
       // Save subscription record to subscriptions table (for dashboard)
+      console.log(`[USE CASE 3 - QUEUE] 💾 Saving subscription record to subscriptions table...`);
       try {
-        await env.DB.prepare(
+        const subInsertResult = await env.DB.prepare(
           `INSERT OR REPLACE INTO subscriptions 
            (user_email, customer_id, subscription_id, status, cancel_at_period_end, cancel_at, 
             current_period_start, current_period_end, billing_period, created_at, updated_at) 
@@ -1081,53 +2025,149 @@ async function processQueueItem(env, queueItem) {
           null, // cancel_at
           subscription.current_period_start || null,
           subscription.current_period_end || null,
-          null, // billing_period (can be fetched later if needed)
+          billingPeriod, // billing_period from Stripe subscription
           timestamp,
           timestamp
         ).run();
+        
+        if (subInsertResult.success) {
+        subscriptionSaved = true;
+          console.log(`[USE CASE 3 - QUEUE] ✅ Subscription record saved to database:`, {
+            subscription_id: subscriptionId,
+            customer_id,
+            user_email,
+            status: subscription.status || 'active',
+            billing_period: billingPeriod,
+            current_period_start: subscription.current_period_start ? new Date(subscription.current_period_start * 1000).toISOString() : null,
+            current_period_end: subscription.current_period_end ? new Date(subscription.current_period_end * 1000).toISOString() : null
+          });
+          
+          // Verify the subscription was saved correctly
+          const verifySub = await env.DB.prepare(
+            `SELECT subscription_id, customer_id, user_email, status, billing_period, current_period_end 
+             FROM subscriptions WHERE subscription_id = ? LIMIT 1`
+          ).bind(subscriptionId).first();
+          
+          if (verifySub) {
+            console.log(`[USE CASE 3 - QUEUE] ✅ Verified subscription in database:`, {
+              subscription_id: verifySub.subscription_id,
+              customer_id: verifySub.customer_id,
+              user_email: verifySub.user_email,
+              status: verifySub.status,
+              billing_period: verifySub.billing_period,
+              current_period_end: verifySub.current_period_end ? new Date(verifySub.current_period_end * 1000).toISOString() : null
+            });
+          } else {
+            console.error(`[USE CASE 3 - QUEUE] ❌ Subscription verification failed - subscription not found in database after insert!`);
+          }
+        } else {
+          console.error(`[USE CASE 3 - QUEUE] ❌ Subscription record insert returned success=false`);
+          throw new Error(`Subscription record insert failed`);
+        }
       } catch (subErr) {
-        console.error(`[QUEUE] ⚠️ Error saving subscription record:`, subErr);
-        // Don't fail the whole operation if subscription record save fails
+        console.error(`[USE CASE 3 - QUEUE] ❌ Error saving subscription record:`, subErr);
+        // If subscription record save fails, throw error to trigger retry
+        throw new Error(`Failed to save subscription record to database: ${subErr.message || String(subErr)}`);
+      }
+      
+      // Only mark as completed AFTER all critical database operations succeed
+      if (licenseSaved && subscriptionSaved) {
+        await env.DB.prepare(
+          `UPDATE subscription_queue 
+           SET status = 'completed', subscription_id = ?, item_id = ?, processed_at = ?, updated_at = ?
+           WHERE queue_id = ?`
+        ).bind(subscriptionId, itemId, timestamp, timestamp, queue_id).run();
+        
+        console.log(`[USE CASE 3 - QUEUE] ✅ Queue item ${queue_id} marked as completed`);
+        console.log(`[USE CASE 3 - QUEUE] 📊 Final Summary for License ${license_key}:`, {
+          license_key,
+          subscription_id: subscriptionId,
+          item_id: itemId,
+          customer_id,
+          user_email,
+          billing_period: billingPeriod,
+          renewal_date: renewalDate ? new Date(renewalDate * 1000).toISOString() : null,
+          queue_status: 'completed',
+          processed_at: new Date(timestamp * 1000).toISOString()
+        });
+        
+        // Verify one-to-one relationship: Each license has exactly one subscription
+        const verifyRelationship = await env.DB.prepare(
+          `SELECT l.license_key, l.subscription_id, l.item_id, s.subscription_id as sub_id, s.status as sub_status
+           FROM licenses l
+           LEFT JOIN subscriptions s ON l.subscription_id = s.subscription_id
+           WHERE l.license_key = ? LIMIT 1`
+        ).bind(license_key).first();
+        
+        if (verifyRelationship && verifyRelationship.subscription_id === verifyRelationship.sub_id) {
+          console.log(`[USE CASE 3 - QUEUE] ✅ Verified one-to-one relationship: License ${license_key} → Subscription ${verifyRelationship.subscription_id}`);
+        } else {
+          console.error(`[USE CASE 3 - QUEUE] ❌ Relationship verification failed! License ${license_key} subscription mismatch.`);
+        }
+        
+        // Save to KV storage (for license key purchase - queue processing)
+        try {
+          console.log(`[USE CASE 3 - QUEUE] 💾 Saving license key to KV storage: ${license_key}`);
+          await saveLicenseKeyToKV(
+            env,
+            license_key,
+            customer_id,
+            subscriptionId,
+            user_email,
+            'complete', // License keys start as complete/active
+            false, // cancelAtPeriodEnd (will be updated when subscription status changes)
+            null // No site name yet (not activated)
+          );
+        } catch (kvErr) {
+          console.error(`[USE CASE 3 - QUEUE] ⚠️ Error saving license key to KV storage (non-blocking):`, kvErr);
+          // Don't fail the whole operation if KV save fails
+        }
+      } else {
+        throw new Error('License or subscription record was not saved successfully');
       }
       
       // Save payment record (for dashboard payment history)
-      try {
-        // Get price amount for payment record
-        let amountPerSubscription = 0;
-        let currency = 'usd';
+      // OPTIMIZATION: Make payment record saving non-blocking to prevent timeouts
+      // Use a separate async operation that doesn't block the main flow
+      (async () => {
         try {
-          const priceRes = await stripeFetch(env, `/prices/${price_id}`);
-          if (priceRes.status === 200) {
-            amountPerSubscription = priceRes.body.unit_amount || 0;
-            currency = priceRes.body.currency || 'usd';
+          // Get price amount for payment record
+          let amountPerSubscription = 0;
+          let currency = 'usd';
+          try {
+            const priceRes = await stripeFetch(env, `/prices/${price_id}`);
+            if (priceRes.status === 200) {
+              amountPerSubscription = priceRes.body.unit_amount || 0;
+              currency = priceRes.body.currency || 'usd';
+            }
+          } catch (priceErr) {
+            console.warn(`[QUEUE] ⚠️ Could not fetch price for payment record:`, priceErr);
           }
-        } catch (priceErr) {
-          console.warn(`[QUEUE] ⚠️ Could not fetch price for payment record:`, priceErr);
+          
+          await env.DB.prepare(
+            `INSERT INTO payments (
+              customer_id, subscription_id, email, amount, currency, 
+              status, site_domain, magic_link, magic_link_generated, 
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            customer_id,
+            subscriptionId,
+            user_email,
+            amountPerSubscription,
+            currency,
+            'succeeded',
+            null, // site_domain (null for quantity purchases)
+            null, // magic_link
+            0, // magic_link_generated
+            timestamp,
+            timestamp
+          ).run();
+        } catch (paymentErr) {
+          console.error(`[QUEUE] ⚠️ Error saving payment record (non-blocking):`, paymentErr);
+          // Don't fail the whole operation if payment record save fails
         }
-        
-        await env.DB.prepare(
-          `INSERT INTO payments (
-            customer_id, subscription_id, email, amount, currency, 
-            status, site_domain, magic_link, magic_link_generated, 
-            created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
-          customer_id,
-          subscriptionId,
-          user_email,
-          amountPerSubscription,
-          currency,
-          'succeeded',
-          null, // site_domain (null for quantity purchases)
-          null, // magic_link
-          0, // magic_link_generated
-          timestamp,
-          timestamp
-        ).run();
-      } catch (paymentErr) {
-        console.error(`[QUEUE] ⚠️ Error saving payment record:`, paymentErr);
-        // Don't fail the whole operation if payment record save fails
-      }
+      })(); // Fire and forget - don't await to prevent timeout
       
       return { success: true, subscriptionId, itemId };
     } else {
@@ -1369,10 +2409,28 @@ async function processRefundsForOldFailedItems(env, limit = 50) {
  * Process pending queue items
  * Can be called via endpoint or scheduled worker
  */
-async function processSubscriptionQueue(env, limit = 10) {
+async function processSubscriptionQueue(env, limit = 100) {
   const timestamp = Math.floor(Date.now() / 1000);
+  const fiveMinutesAgo = timestamp - (5 * 60); // 5 minutes in seconds
   
   try {
+    // First, reset items stuck in 'processing' status for more than 5 minutes back to 'pending'
+    // This handles cases where the worker crashed or timed out while processing
+    try {
+      const resetResult = await env.DB.prepare(
+        `UPDATE subscription_queue 
+         SET status = 'pending', updated_at = ?
+         WHERE status = 'processing' 
+         AND updated_at < ?`
+      ).bind(timestamp, fiveMinutesAgo).run();
+      
+      if (resetResult.meta.changes > 0) {
+        console.log(`[QUEUE] 🔄 Reset ${resetResult.meta.changes} stuck 'processing' items back to 'pending'`);
+      }
+    } catch (resetErr) {
+      console.warn(`[QUEUE] ⚠️ Could not reset stuck processing items:`, resetErr);
+    }
+    
     // Get pending items that are ready to process (next_retry_at is null or in the past)
     const queueItems = await env.DB.prepare(
       `SELECT * FROM subscription_queue 
@@ -1386,28 +2444,51 @@ async function processSubscriptionQueue(env, limit = 10) {
       return { processed: 0, message: 'No pending queue items' };
     }
     
+    console.log(`[QUEUE] 📋 Processing ${queueItems.results.length} queue items...`);
     
     let successCount = 0;
     let failCount = 0;
+    let skippedCount = 0;
     
     for (const item of queueItems.results) {
-      // Mark as processing
-      await env.DB.prepare(
-        `UPDATE subscription_queue SET status = 'processing', updated_at = ? WHERE queue_id = ?`
+      // CRITICAL: Atomic lock mechanism - only update if status is still 'pending'
+      // This prevents concurrent processes from processing the same queue item
+      // The WHERE clause acts as a lock - only one process can successfully update
+      const lockResult = await env.DB.prepare(
+        `UPDATE subscription_queue 
+         SET status = 'processing', updated_at = ? 
+         WHERE queue_id = ? AND status = 'pending'`
       ).bind(timestamp, item.queue_id).run();
       
+      // Check if we successfully acquired the lock (rows affected > 0)
+      if (lockResult.meta.changes === 0) {
+        // Another process already acquired the lock or item is no longer pending
+        console.log(`[QUEUE] ⚠️ Could not acquire lock for queue item ${item.queue_id} - already being processed by another worker or status changed`);
+        skippedCount++;
+        continue;
+      }
+      
+      // Lock acquired successfully - proceed with processing
       const result = await processQueueItem(env, item);
       if (result.success) {
         successCount++;
+        console.log(`[QUEUE] ✅ Successfully processed queue item ${item.queue_id} for license ${item.license_key}`);
       } else {
         failCount++;
+        console.error(`[QUEUE] ❌ Failed to process queue item ${item.queue_id} for license ${item.license_key}: ${result.error}`);
       }
       
       // Small delay between processing to respect rate limits
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     
-    return { processed: queueItems.results.length, successCount, failCount };
+    if (skippedCount > 0) {
+      console.log(`[QUEUE] ⚠️ Skipped ${skippedCount} queue items (lock already acquired by another process)`);
+    }
+    
+    console.log(`[QUEUE] ✅ Queue processing complete: ${successCount} succeeded, ${failCount} failed, ${skippedCount} skipped (lock conflict) out of ${queueItems.results.length} total`);
+    
+    return { processed: queueItems.results.length, successCount, failCount, skippedCount };
   } catch (error) {
     console.error(`[QUEUE] ❌ Error processing queue:`, error);
     return { processed: 0, error: error.message };
@@ -1460,15 +2541,63 @@ async function stripeFetch(env, path, method = 'GET', body = null, form = false)
 
 export default {
   // Scheduled event handler - processes subscription queue automatically
+  // Runs every 1 minute (configured in wrangler.jsonc: "*/1 * * * *")
+  // Exits early if no pending items to minimize resource usage
+  
+
+ 
+    
   async scheduled(event, env, ctx) {
+    const timestamp = Math.floor(Date.now() / 1000);
     
     try {
-      // Process up to 50 queue items per run (adjust based on your needs)
-      const queueResult = await processSubscriptionQueue(env, 50);
+      // Quick check: Are there any pending items or failed items that need refunds?
+      const pendingCheck = await env.DB.prepare(
+        `SELECT COUNT(*) as count FROM subscription_queue 
+         WHERE status = 'pending' 
+         AND (next_retry_at IS NULL OR next_retry_at <= ?)
+         LIMIT 1`
+      ).bind(timestamp).first();
       
+      const twelveHoursAgo = timestamp - (12 * 60 * 60);
+      const failedCheck = await env.DB.prepare(
+        `SELECT COUNT(*) as count FROM subscription_queue 
+         WHERE status = 'failed' 
+         AND created_at <= ?
+         AND error_message NOT LIKE '%REFUNDED:%'
+         LIMIT 1`
+      ).bind(twelveHoursAgo).first();
       
-      // Process refunds for failed items older than 12 hours
-      const refundResult = await processRefundsForOldFailedItems(env, 50);
+      const hasPending = (pendingCheck?.count || 0) > 0;
+      const hasFailed = (failedCheck?.count || 0) > 0;
+      
+      // Early exit if nothing to process
+      if (!hasPending && !hasFailed) {
+        console.log(`[SCHEDULED] ⏸️ No pending items or failed items to process. Skipping execution.`);
+        return new Response(JSON.stringify({
+          success: true,
+          skipped: true,
+          message: 'No pending or failed items to process',
+          timestamp: new Date().toISOString()
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      console.log(`[SCHEDULED] 🕐 Starting scheduled queue processing at ${new Date().toISOString()}`);
+      
+      // Process up to 100 queue items per run to handle large batches
+      // This ensures all pending subscriptions are created even for large purchases
+      const queueResult = await processSubscriptionQueue(env, 100);
+      
+      console.log(`[SCHEDULED] ✅ Queue processing result:`, queueResult);
+      
+      // Process refunds for failed items older than 12 hours (only if there are failed items)
+      let refundResult = { processed: 0, refunded: 0, message: 'No failed items to refund' };
+      if (hasFailed) {
+        refundResult = await processRefundsForOldFailedItems(env, 50);
+      console.log(`[SCHEDULED] ✅ Refund processing result:`, refundResult);
+      }
       
       // Return success
       return new Response(JSON.stringify({
@@ -1480,7 +2609,7 @@ export default {
         headers: { 'Content-Type': 'application/json' }
       });
     } catch (error) {
-      console.error(`[SCHEDULED] Error processing queue:`, error);
+      console.error(`[SCHEDULED] ❌ Error processing queue:`, error);
       
       return new Response(JSON.stringify({
         success: false,
@@ -1591,7 +2720,13 @@ export default {
           return new Response('Invalid signature or payload', { status: 400 });
         }
 
-        // Log all webhook events for debugging
+        // Log all webhook events for debugging and tracking
+        const subscriptionId = event.data?.object?.subscription || event.data?.object?.id || null;
+        const customerId = event.data?.object?.customer || null;
+        await logStripeEvent(env, event, subscriptionId, customerId, {
+          action: 'webhook_received',
+          note: 'Initial webhook event received'
+        });
         
         try {
         // Handle checkout.session.completed - save payment details and generate magic link
@@ -1614,143 +2749,7 @@ export default {
           let customFieldSiteUrl = null;
           let billingPeriod = null;
           let billingInterval = null;
-          
-          const example_object=`{
-  "object": {
-    "id": "cs_test_a1JjTk6wNepu1ubanKYxj03OB1ebzEvhbD7JrAHa1JrzGPo8XbemeyCc9f",
-    "object": "checkout.session",
-    "adaptive_pricing": {
-      "enabled": false
-    },
-    "after_expiration": null,
-    "allow_promotion_codes": false,
-    "amount_subtotal": 200,
-    "amount_total": 200,
-    "automatic_tax": {
-      "enabled": false,
-      "liability": null,
-      "provider": null,
-      "status": null
-    },
-    "billing_address_collection": "auto",
-    "cancel_url": "https://stripe.com",
-    "client_reference_id": null,
-    "client_secret": null,
-    "collected_information": {
-      "business_name": null,
-      "individual_name": null,
-      "shipping_details": null
-    },
-    "consent": null,
-    "consent_collection": {
-      "payment_method_reuse_agreement": null,
-      "promotions": "none",
-      "terms_of_service": "none"
-    },
-    "created": 1766587887,
-    "currency": "usd",
-    "currency_conversion": null,
-    "custom_fields": [
-      {
-        "key": "enteryourlivedomain",
-        "label": {
-          "custom": "Enter your Live Domain",
-          "type": "custom"
-        },
-        "optional": false,
-        "text": {
-          "default_value": null,
-          "maximum_length": null,
-          "minimum_length": null,
-          "value": "www.test.com"
-        },
-        "type": "text"
-      }
-    ],
-    "custom_text": {
-      "after_submit": null,
-      "shipping_address": null,
-      "submit": null,
-      "terms_of_service_acceptance": null
-    },
-    "customer": "cus_TfDrvl3iCdWirl",
-    "customer_account": null,
-    "customer_creation": "if_required",
-    "customer_details": {
-      "address": {
-        "city": "Washington",
-        "country": "IN",
-        "line1": "Albin",
-        "line2": "abc",
-        "postal_code": "467868",
-        "state": "KL"
-      },
-      "business_name": null,
-      "email": "reshma@seattlenewmedia.com",
-      "individual_name": null,
-      "name": "meena",
-      "phone": null,
-      "tax_exempt": "none",
-      "tax_ids": []
-    },
-    "customer_email": null,
-    "discounts": [],
-    "expires_at": 1766674287,
-    "invoice": "in_1ShtPvSAczuHLTOtQ2c4nD54",
-    "invoice_creation": null,
-    "livemode": false,
-    "locale": "auto",
-    "metadata": {},
-    "mode": "subscription",
-    "origin_context": null,
-    "payment_intent": null,
-    "payment_link": "plink_1ShWZUSAczuHLTOtiAmIzgJt",
-    "payment_method_collection": "always",
-    "payment_method_configuration_details": {
-      "id": "pmc_1Q3NUpSAczuHLTOtmYftKx5t",
-      "parent": null
-    },
-    "payment_method_options": {
-      "card": {
-        "request_three_d_secure": "automatic"
-      }
-    },
-    "payment_method_types": [
-      "card"
-    ],
-    "payment_status": "paid",
-    "permissions": null,
-    "phone_number_collection": {
-      "enabled": false
-    },
-    "recovered_from": null,
-    "saved_payment_method_options": {
-      "allow_redisplay_filters": [
-        "always"
-      ],
-      "payment_method_remove": "disabled",
-      "payment_method_save": null
-    },
-    "setup_intent": null,
-    "shipping_address_collection": null,
-    "shipping_cost": null,
-    "shipping_details": null,
-    "shipping_options": [],
-    "status": "complete",
-    "submit_type": "auto",
-    "subscription": "sub_1ShtQ2SAczuHLTOt8gzoOZjs",
-    "success_url": "https://memberstack-login-test-713fa5.webflow.io?session_id={CHECKOUT_SESSION_ID}",
-    "total_details": {
-      "amount_discount": 0,
-      "amount_shipping": 0,
-      "amount_tax": 0
-    },
-    "ui_mode": "hosted",
-    "url": null,
-    "wallet_options": null
-  },
-  "previous_attributes": null
-}`;
+
           const session = event.data.object;
           // Note: subscriptionId and customerId are already declared at the top of the handler
           subscriptionId = session.subscription;
@@ -1811,876 +2810,498 @@ export default {
           // STEP 2: ROUTE TO APPROPRIATE HANDLER
           // ========================================
           // Route to Use Case 3 handler
-          if (identifiedUseCase === '3') {
-            
-            // ========================================
-            // USE CASE 3 HANDLER: Quantity Purchase
-            // ========================================
-            // Get payment_intent from session
-            const paymentIntentId = session.payment_intent;
-            if (paymentIntentId && typeof paymentIntentId === 'string') {
+       // Route to Use Case 3 handler
+if (identifiedUseCase === '3') {
+
+  // ========================================
+  // USE CASE 3 HANDLER: Quantity Purchase
+  // ALWAYS QUEUE, NEVER IMMEDIATE
+  // ========================================
+
+  const paymentIntentId = session.payment_intent;
+
+  if (paymentIntentId && typeof paymentIntentId === 'string') {
+    try {
+      // 1) Fetch payment intent + metadata
+      const piRes = await stripeFetch(env, `/payment_intents/${paymentIntentId}`);
+      if (piRes.status === 200) {
+        const paymentIntent = piRes.body;
+       let metadata = paymentIntent.metadata || {};
+
+        // Also merge charge metadata if needed
+        if (!metadata.usecase && paymentIntent.latest_charge) {
+          try {
+            const chargeRes = await stripeFetch(env, `/charges/${paymentIntent.latest_charge}`);
+            if (chargeRes.status === 200 && chargeRes.body.metadata) {
+              metadata = { ...metadata, ...chargeRes.body.metadata };
+            }
+          } catch (chargeErr) {
+            console.warn(`[checkout.session.completed] Could not fetch charge metadata:`, chargeErr);
+          }
+        }
+
+        // Only handle Use Case 3
+        if (metadata.usecase === '3') {
+
+          // 2) Resolve customer id for this use case
+          const useCase3CustomerId =
+
+            session.customer ||
+            metadata.customer_id ||
+            paymentIntent.customer;
+
+          // 3) Load license keys (temporary) from metadata / customer
+          let licenseKeys = [];
+          try {
+            if (metadata.license_keys) {
+              // Stored directly on payment_intent metadata
+              licenseKeys = JSON.parse(metadata.license_keys);
+            } else if (
+              metadata.license_keys_source === 'customer_metadata' ||
+              metadata.license_keys_count
+            ) {
+              // For large quantity, keys are on customer metadata
               try {
-                // Fetch payment intent to get metadata
-                const piRes = await stripeFetch(env, `/payment_intents/${paymentIntentId}`);
-                if (piRes.status === 200) {
-                  const paymentIntent = piRes.body;
-                  let metadata = paymentIntent.metadata || {};
-                  
-                  // Also check charge metadata
-                  if (!metadata.usecase && paymentIntent.latest_charge) {
-                    try {
-                      const chargeRes = await stripeFetch(env, `/charges/${paymentIntent.latest_charge}`);
-                      if (chargeRes.status === 200 && chargeRes.body.metadata) {
-                        metadata = { ...metadata, ...chargeRes.body.metadata };
-                      }
-                    } catch (chargeErr) {
-                      console.warn(`[checkout.session.completed] Could not fetch charge metadata:`, chargeErr);
-                    }
-                  }
-                  
-                  // Process Use Case 3 if metadata is correct
-                  if (metadata.usecase === '3') {
-                    
-                    // Use session.customer directly (following Stripe docs pattern)
-                    const useCase3CustomerId = session.customer || metadata.customer_id || paymentIntent.customer;
-                    
-                    // Check if already processed by checking if licenses exist (idempotency)
-                    let licenseKeys = [];
-                    try {
-                      if (metadata.license_keys) {
-                        licenseKeys = JSON.parse(metadata.license_keys);
-                      }
-                    } catch (e) {
-                      console.error(`[checkout.session.completed] Error parsing license_keys:`, e);
-                    }
-                    
-                    if (env.DB && licenseKeys.length > 0) {
-                      try {
-                        const existingLicenseCheck = await env.DB.prepare(
-                          `SELECT license_key FROM licenses WHERE license_key = ? LIMIT 1`
-                        ).bind(licenseKeys[0]).first();
-                        
-                        if (existingLicenseCheck) {
-                          return new Response('ok');
-                        }
-                      } catch (checkErr) {
-                        console.warn(`[checkout.session.completed] Could not check existing licenses:`, checkErr);
-                      }
-                    }
-                    
-                    // Get user email
-                    const userEmail = await getCustomerEmail(env, useCase3CustomerId);
-                    if (!userEmail) {
-                      console.warn('[checkout.session.completed] User email not found for Use Case 3');
-                      return new Response('ok');
-                    }
-                    
-                    // Parse metadata
-                    let priceId = null;
-                    let quantity = 0;
-                    
-                    try {
-                      if (metadata.license_keys) {
-                        licenseKeys = JSON.parse(metadata.license_keys);
-                      } else {
-                        console.warn(`[checkout.session.completed] ⚠️ No license_keys found in metadata. Available keys: ${Object.keys(metadata).join(', ')}`);
-                      }
-                      priceId = metadata.price_id || null;
-                      quantity = parseInt(metadata.quantity) || licenseKeys.length || 0;
-                    } catch (parseErr) {
-                      console.error('[checkout.session.completed] ❌ Error parsing metadata:', parseErr);
-                    }
-                    
-                    // ========================================
-                    // STEP 1: FIRST - Save payment method to customer
-                    // Following Stripe's recommended pattern exactly
-                    // Reference: https://stripe.com/docs/payments/save-during-payment
-                    // MUST complete successfully before proceeding to create subscriptions
-                    // ========================================
-                    // Get payment method from payment intent (session.payment_method may not be available)
-                    let paymentMethodId = paymentIntent.payment_method;
-                    
-                    // If not in payment intent, try to get from charge
-                    if (!paymentMethodId && paymentIntent.latest_charge) {
-                      try {
-                        const chargeRes = await stripeFetch(env, `/charges/${paymentIntent.latest_charge}`);
-                        if (chargeRes.status === 200 && chargeRes.body.payment_method) {
-                          paymentMethodId = chargeRes.body.payment_method;
-                        }
-                      } catch (chargeErr) {
-                        console.warn(`[checkout.session.completed] Could not fetch charge for payment method:`, chargeErr);
-                      }
-                    }
-                    
-                    // Use session.customer (primary) or fallback to paymentIntent.customer
-                    const customerIdForPaymentMethod = session.customer || paymentIntent.customer || useCase3CustomerId;
-                    
-                    let paymentMethodSaved = false;
-                    if (paymentMethodId && customerIdForPaymentMethod) {
-                      try {
-                        
-                        // Attach the payment method used in checkout to the customer
-                        const attachRes = await stripeFetch(env, `/payment_methods/${paymentMethodId}/attach`, 'POST', {
-                          'customer': customerIdForPaymentMethod
-                        }, true);
-                        
-                        if (attachRes.status === 200) {
-                          // Set it as the default payment method
-                          const setDefaultRes = await stripeFetch(env, `/customers/${customerIdForPaymentMethod}`, 'POST', {
-                            'invoice_settings[default_payment_method]': paymentMethodId
-                          }, true);
-                          
-                          if (setDefaultRes.status === 200) {
-                            paymentMethodSaved = true;
-                          } else {
-                            console.warn(`[checkout.session.completed] ⚠️ Payment method attached but failed to set as default:`, setDefaultRes.status, setDefaultRes.body);
-                          }
-                        } else {
-                          // Check if it's already attached
-                          const errorMessage = attachRes.body?.error?.message || '';
-                          if (errorMessage.includes('already attached') || errorMessage.includes('already been attached')) {
-                            // Just set as default
-                            const setDefaultRes = await stripeFetch(env, `/customers/${customerIdForPaymentMethod}`, 'POST', {
-                              'invoice_settings[default_payment_method]': paymentMethodId
-                            }, true);
-                            
-                            if (setDefaultRes.status === 200) {
-                              paymentMethodSaved = true;
-                            } else {
-                              console.warn(`[checkout.session.completed] ⚠️ Failed to set payment method as default:`, setDefaultRes.status, setDefaultRes.body);
-                            }
-                          } else {
-                            console.error(`[checkout.session.completed] ❌ STEP 1 FAILED: Failed to attach payment method:`, attachRes.status, attachRes.body);
-                          }
-                        }
-                      } catch (attachErr) {
-                        console.error(`[checkout.session.completed] ❌ STEP 1 FAILED: Error attaching payment method:`, attachErr);
-                      }
-                    } else {
-                      console.error(`[checkout.session.completed] ❌ STEP 1 FAILED: Missing payment_method or customer. payment_method: ${paymentMethodId}, customer: ${customerIdForPaymentMethod}`);
-                    }
-                    
-                    // ========================================
-                    // STEP 2: THEN - Create subscriptions (only if payment method was saved)
-                    // No need to specify payment_method since we set the default above
-                    // Following Stripe's recommended pattern
-                    // ========================================
-                    const createdSubscriptionIds = [];
-                    // Use the same customer ID we used for payment method attachment
-                    const customerIdForSubscriptions = customerIdForPaymentMethod || session.customer || useCase3CustomerId;
-                    
-                    // Debug logging to understand why subscriptions aren't being created
-                    
-                    // Declare these at a higher scope so they're available for license key storage
-                    const failedSubscriptions = []; // Track failed subscriptions for refund
-                    const failedLicenseKeys = []; // Track license keys for failed subscriptions
-                    const successfulLicenseSubscriptions = []; // Track successful license-subscription pairs: {licenseKey, subscriptionId, itemId}
-                    const savedLicenseKeys = new Set(); // Track which licenses have been saved to prevent duplicates
-                    
-                    if (paymentMethodSaved && priceId && quantity > 0 && customerIdForSubscriptions) {
-                      try {
-                        
-                        // Calculate trial_end ONCE before loop - all subscriptions get same trial_end
-                        // Use trial_end to skip first invoice (payment already collected via checkout)
-                        // Trial prevents invoice creation until trial ends
-                        // Priority: Custom trial days (env/metadata) > Billing interval > Default (30 days)
-                        const now = Math.floor(Date.now() / 1000);
-                        
-                        // Check for custom trial period (environment variable or metadata)
-                        let trialPeriodDays = null;
-                        if (env.TRIAL_PERIOD_DAYS) {
-                          trialPeriodDays = parseInt(env.TRIAL_PERIOD_DAYS);
-                        } else if (session.metadata?.trial_period_days) {
-                          trialPeriodDays = parseInt(session.metadata.trial_period_days);
-                        }
-                        
-                        // Get price details to determine billing interval (if no custom trial period)
-                        let trialPeriodSeconds = 30 * 24 * 60 * 60; // Default: 30 days (monthly)
-                        let billingInterval = 'month'; // Default
-                        
-                        if (trialPeriodDays) {
-                          // Use custom trial period
-                          trialPeriodSeconds = trialPeriodDays * 24 * 60 * 60;
-                        } else {
-                          // Calculate based on billing interval
-                          try {
-                            const priceRes = await stripeFetch(env, `/prices/${priceId}`);
-                            if (priceRes.status === 200 && priceRes.body.recurring) {
-                              billingInterval = priceRes.body.recurring.interval;
-                              const intervalCount = priceRes.body.recurring.interval_count || 1;
-                              
-                              // Calculate trial period based on billing interval
-                              if (billingInterval === 'week') {
-                                trialPeriodSeconds = 7 * 24 * 60 * 60 * intervalCount; // Weekly
-                              } else if (billingInterval === 'month') {
-                                trialPeriodSeconds = 30 * 24 * 60 * 60 * intervalCount; // Monthly (approximate)
-                              } else if (billingInterval === 'year') {
-                                trialPeriodSeconds = 365 * 24 * 60 * 60 * intervalCount; // Yearly
-                              } else if (billingInterval === 'day') {
-                                trialPeriodSeconds = 24 * 60 * 60 * intervalCount; // Daily
-                              }
-                              
-                            }
-                          } catch (priceErr) {
-                            console.warn(`[checkout.session.completed] ⚠️ Could not fetch price details, using default 30 days:`, priceErr);
-                          }
-                        }
-                        
-                        const trialEndTime = now + trialPeriodSeconds;
-                        
-                        // Ensure trial_end is at least 1 hour in the future (Stripe requirement)
-                        // For daily billing, use at least 7 days to prevent immediate invoice creation
-                        const minimumTrialEnd = billingInterval === 'day' 
-                          ? now + (7 * 24 * 60 * 60) // 7 days minimum for daily billing
-                          : now + 3600; // 1 hour minimum for other intervals
-                        const trialEnd = Math.max(trialEndTime, minimumTrialEnd);
-                        
-                        const trialSource = trialPeriodDays ? `custom (${trialPeriodDays} days)` : `billing interval (${billingInterval})`;
-                        
-                        // QUEUE-BASED PROCESSING: For large quantities (>10), use queue to prevent timeouts
-                        // For smaller quantities, process immediately
-                        const USE_QUEUE_THRESHOLD = 10; // Use queue for quantities > 10
-                        const BATCH_SIZE = 5; // Process 5 subscriptions per batch (for immediate processing)
-                        const DELAY_BETWEEN_BATCHES = 200; // 200ms delay between batches
-                        
-                        // Initialize queue tracking variables (used in both QUEUE and IMMEDIATE modes)
-                        let queuedCount = 0;
-                        let queueErrors = 0;
-                        
-                        if (quantity > USE_QUEUE_THRESHOLD) {
-                          // QUEUE MODE: Add all subscriptions to queue for async processing
-                          
-                          for (let i = 0; i < quantity; i++) {
-                            const queueResult = await addToSubscriptionQueue(env, {
-                              customerId: customerIdForSubscriptions,
-                              userEmail: userEmail,
-                              paymentIntentId: paymentIntent.id,
-                              priceId: priceId,
-                              licenseKey: licenseKeys[i],
-                              quantity: 1,
-                              trialEnd: trialEnd
-                            });
-                            
-                            if (queueResult.success) {
-                              queuedCount++;
-                            } else {
-                              queueErrors++;
-                              // Track failed queue additions for refund
-                              failedSubscriptions.push({ 
-                                licenseKey: licenseKeys[i], 
-                                reason: 'queue_add_failed',
-                                error: queueResult.error 
-                              });
-                              failedLicenseKeys.push(licenseKeys[i]);
-                            }
-                          }
-                          
-                          
-                          // Process first batch immediately if possible (to give user immediate feedback)
-                          const IMMEDIATE_BATCH_SIZE = Math.min(5, quantity);
-                          
-                          // Track which queue items were processed immediately so we can mark them as completed
-                          const immediateQueueIds = [];
-                          
-                          for (let i = 0; i < IMMEDIATE_BATCH_SIZE; i++) {
-                            try {
-                              const createSubRes = await stripeFetch(env, '/subscriptions', 'POST', {
-                                'customer': customerIdForSubscriptions,
-                                'items[0][price]': priceId,
-                                'items[0][quantity]': 1,
-                                'metadata[license_key]': licenseKeys[i],
-                                'metadata[usecase]': '3',
-                                'metadata[purchase_type]': 'quantity',
-                                'proration_behavior': 'none',
-                                'collection_method': 'charge_automatically',
-                                'trial_end': trialEnd.toString()
-                              }, true);
-                              
-                              if (createSubRes.status === 200) {
-                                const newSubscription = createSubRes.body;
-                                createdSubscriptionIds.push(newSubscription.id);
-                                const itemId = newSubscription.items?.data?.[0]?.id || null;
-                                
-                                successfulLicenseSubscriptions.push({
-                                  licenseKey: licenseKeys[i],
-                                  subscriptionId: newSubscription.id,
-                                  itemId: itemId
-                                });
-                                
-                                
-                                // Find and mark the corresponding queue item as completed
-                                // Queue ID format: queue_{paymentIntentId}_{licenseKey}_{timestamp}
-                                try {
-                                  const queueResult = await env.DB.prepare(
-                                    `SELECT queue_id FROM subscription_queue 
-                                     WHERE payment_intent_id = ? AND license_key = ? AND status = 'pending'
-                                     ORDER BY created_at ASC LIMIT 1`
-                                  ).bind(paymentIntent.id, licenseKeys[i]).first();
-                                  
-                                  if (queueResult && queueResult.queue_id) {
-                                    immediateQueueIds.push(queueResult.queue_id);
-                                    const timestamp = Math.floor(Date.now() / 1000);
-                                    await env.DB.prepare(
-                                      `UPDATE subscription_queue 
-                                       SET status = 'completed', subscription_id = ?, item_id = ?, processed_at = ?, updated_at = ?
-                                       WHERE queue_id = ?`
-                                    ).bind(newSubscription.id, itemId, timestamp, timestamp, queueResult.queue_id).run();
-                                  }
-                                } catch (queueUpdateErr) {
-                                  console.warn(`[checkout.session.completed] ⚠️ Could not mark queue item as completed for license ${licenseKeys[i]}:`, queueUpdateErr);
-                                  // Don't fail - subscription was created successfully
-                                }
-                              }
-                            } catch (error) {
-                              console.error(`[checkout.session.completed] ❌ Error creating immediate subscription ${i + 1}:`, error);
-                            }
-                          }
-                          
-                          if (immediateQueueIds.length > 0) {
-                          }
-                        } else {
-                          // IMMEDIATE MODE: Process all subscriptions immediately (for small quantities)
-                          const totalBatches = Math.ceil(quantity / BATCH_SIZE);
-                          
-                          for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
-                          const batchNumber = batchIndex + 1;
-                          const startIndex = batchIndex * BATCH_SIZE;
-                          const endIndex = Math.min(startIndex + BATCH_SIZE, quantity);
-                          const batchSize = endIndex - startIndex;
-                          
-                          
-                          // Process each subscription in the current batch
-                          for (let i = startIndex; i < endIndex; i++) {
-                            const positionInBatch = (i % BATCH_SIZE) + 1;
-                            
-                            try {
-                              // OPTIMIZATION: No delay between subscriptions - process as fast as possible
-                              // Stripe can handle rapid sequential requests for the same customer
-                            
-                              // Create subscription - uses default payment method we set above
-                            // All subscriptions use the same trial_end calculated above
-                            const createSubRes = await stripeFetch(env, '/subscriptions', 'POST', {
-                            'customer': customerIdForSubscriptions,
-                            'items[0][price]': priceId,
-                            'items[0][quantity]': 1,
-                            'metadata[license_key]': licenseKeys[i],
-                            'metadata[usecase]': '3',
-                            'metadata[purchase_type]': 'quantity',
-                            'proration_behavior': 'none',
-                            'collection_method': 'charge_automatically', // Use automatic charging
-                            'trial_end': trialEnd.toString(), // Skip first invoice - payment already collected via checkout
-                            // No need to specify payment_method - uses default we set above
-                          }, true);
-                          
-                          
-                          if (createSubRes.status === 200) {
-                            const newSubscription = createSubRes.body;
-                            createdSubscriptionIds.push(newSubscription.id);
-                            const itemId = newSubscription.items?.data?.[0]?.id || null;
-                            
-                            // Verify payment was successful
-                            // With trial_end, no invoice should be created until trial ends
-                            // Payment already collected via checkout, so we just verify payment success
-                            const paymentVerified = verifyPaymentSuccess(session, paymentIntent);
-                            
-                            if (!paymentVerified) {
-                              console.error(`[checkout.session.completed] ❌ Payment verification failed. Session payment_status: ${session.payment_status}, Session status: ${session.status}, PaymentIntent status: ${paymentIntent?.status || 'N/A'}`);
-                              // Track as failed for refund
-                              failedSubscriptions.push({ licenseKey: licenseKeys[i], reason: 'payment_verification_failed' });
-                              failedLicenseKeys.push(licenseKeys[i]);
-                              // Don't add to successfulLicenseSubscriptions - subscription created but payment not verified
-                            } else {
-                              // Payment verified - subscription created with trial_end (no invoice until trial ends)
-                              
-                              // OPTIMIZATION: Only check invoice if it exists AND we're processing a small batch
-                              // For large batches (>10), skip invoice checking to avoid timeout - handle refunds in background
-                              // With 7-day minimum trial for daily billing, invoices shouldn't be created anyway
-                              if (newSubscription.latest_invoice && quantity <= 10) {
-                                const invoiceId = typeof newSubscription.latest_invoice === 'string' 
-                                  ? newSubscription.latest_invoice 
-                                  : newSubscription.latest_invoice.id;
-                                
-                                try {
-                                  const invoiceRes = await stripeFetch(env, `/invoices/${invoiceId}`);
-                                  if (invoiceRes.status === 200) {
-                                    const invoice = invoiceRes.body;
-                                    if (invoice.status === 'open' || invoice.status === 'draft') {
-                                      // Immediately void/delete to prevent auto-payment
-                                      if (invoice.status === 'open') {
-                                        await stripeFetch(env, `/invoices/${invoiceId}/void`, 'POST', {}, true);
-                                      } else {
-                                        await stripeFetch(env, `/invoices/${invoiceId}`, 'DELETE', {}, false);
-                                      }
-                                    } else if (invoice.status === 'paid') {
-                                      // Invoice was auto-paid - log for background processing
-                                      console.warn(`[checkout.session.completed] ⚠️ Invoice ${invoiceId} was auto-paid - will be refunded in background`);
-                                      // Store for background refund processing (don't block here)
-                                      failedSubscriptions.push({ 
-                                        licenseKey: licenseKeys[i], 
-                                        reason: 'auto_paid_invoice_needs_refund', 
-                                        invoiceId: invoiceId,
-                                        subscriptionId: newSubscription.id
-                                      });
-                                    }
-                                  }
-                                } catch (invoiceErr) {
-                                  console.warn(`[checkout.session.completed] ⚠️ Error handling unexpected invoice:`, invoiceErr);
-                                }
-                              } else if (newSubscription.latest_invoice && quantity > 10) {
-                                // For large batches, just log and handle in background
-                                const invoiceId = typeof newSubscription.latest_invoice === 'string' 
-                                  ? newSubscription.latest_invoice 
-                                  : newSubscription.latest_invoice.id;
-                                console.warn(`[checkout.session.completed] ⚠️ Subscription ${newSubscription.id} has invoice ${invoiceId} - skipping check for large batch (will handle in background)`);
-                                // Store for background processing
-                                failedSubscriptions.push({ 
-                                  licenseKey: licenseKeys[i], 
-                                  reason: 'invoice_check_skipped_large_batch', 
-                                  invoiceId: invoiceId,
-                                  subscriptionId: newSubscription.id
-                                });
-                              }
-                            }
-                            
-                            // Track as successful if subscription was created (even if invoice was auto-paid and refunded)
-                            // The subscription is valid - we just need to handle the duplicate payment via refund
-                            if (createSubRes.status === 200) {
-                              successfulLicenseSubscriptions.push({
-                                licenseKey: licenseKeys[i],
-                                subscriptionId: newSubscription.id,
-                                itemId: itemId
-                              });
-                            } else {
-                              console.warn(`[checkout.session.completed] ⚠️ Subscription creation failed, not adding to successful list`);
-                            }
-                            
-                            // OPTIMIZATION: Skip metadata update for large batches to save time
-                            if (itemId && quantity <= 10) {
-                              await stripeFetch(env, `/subscription_items/${itemId}`, 'POST', {
-                                'metadata[license_key]': licenseKeys[i]
-                              }, true);
-                            } else if (itemId && quantity > 10) {
-                              // For large batches, skip metadata update to save time - can be done later
-                            }
-                          } else {
-                            console.error(`[checkout.session.completed] ❌ Failed to create subscription ${i + 1}/${quantity}:`, createSubRes.status, createSubRes.body);
-                            // Track failed subscription for refund
-                            failedSubscriptions.push({ licenseKey: licenseKeys[i], reason: 'subscription_creation_failed', status: createSubRes.status });
-                            failedLicenseKeys.push(licenseKeys[i]);
-                            // Continue to next subscription even if this one failed
-                          }
-                          } catch (subError) {
-                            // Catch any errors during subscription creation to ensure loop continues
-                            console.error(`[checkout.session.completed] ❌ Error creating subscription ${i + 1}/${quantity} for license ${licenseKeys[i]}:`, subError);
-                            failedSubscriptions.push({ licenseKey: licenseKeys[i], reason: 'subscription_creation_error', error: subError.message || String(subError) });
-                            failedLicenseKeys.push(licenseKeys[i]);
-                            // Continue to next subscription
-                          }
-                          } // End of inner loop (subscriptions in batch)
-                          
-                          // Batch completed - log summary
-                          
-                          // OPTIMIZATION: Save licenses incrementally after each batch to prevent data loss on timeout
-                          // This ensures licenses are saved even if webhook times out before all batches complete
-                          if (env.DB && successfulLicenseSubscriptions.length > 0) {
-                            const timestamp = Math.floor(Date.now() / 1000);
-                            let batchLicensesSaved = 0;
-                            
-                            // Save all licenses created in this batch (those with indices in the current batch range)
-                            for (let i = startIndex; i < endIndex; i++) {
-                              const licenseKey = licenseKeys[i];
-                              
-                              // Skip if already saved
-                              if (savedLicenseKeys.has(licenseKey)) {
-                                continue;
-                              }
-                              
-                              // Find the corresponding subscription data
-                              const licenseSub = successfulLicenseSubscriptions.find(s => s.licenseKey === licenseKey);
-                              if (!licenseSub) {
-                                continue; // Subscription wasn't created successfully for this license
-                              }
-                              
-                              const { subscriptionId, itemId } = licenseSub;
-                              
-                              try {
-                                const existingLicense = await env.DB.prepare(
-                                  `SELECT license_key FROM licenses WHERE license_key = ?`
-                                ).bind(licenseKey).first();
-                                
-                                if (existingLicense) {
-                                  savedLicenseKeys.add(licenseKey);
-                                  continue;
-                                }
-                                
-                                await env.DB.prepare(
-                                  `INSERT INTO licenses 
-                                   (license_key, customer_id, subscription_id, item_id, 
-                                    site_domain, used_site_domain, status, purchase_type, created_at, updated_at)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                                ).bind(
-                                  licenseKey,
-                                  customerIdForSubscriptions,
-                                  subscriptionId,
-                                  itemId || null,
-                                  null,
-                                  null,
-                                  'active',
-                                  'quantity',
-                                  timestamp,
-                                  timestamp
-                                ).run();
-                                
-                                savedLicenseKeys.add(licenseKey);
-                                batchLicensesSaved++;
-                              } catch (insertErr) {
-                                if (insertErr.message && insertErr.message.includes('UNIQUE constraint')) {
-                                  savedLicenseKeys.add(licenseKey);
-                                  console.warn(`[checkout.session.completed] ⚠️ License key ${licenseKey} already exists, skipping`);
-                                } else {
-                                  console.error(`[checkout.session.completed] ❌ Error storing license ${licenseKey}:`, insertErr);
-                                }
-                              }
-                            }
-                            
-                            if (batchLicensesSaved > 0) {
-                            }
-                          }
-                          
-                          // Add delay between batches (except after the last batch)
-                          if (batchIndex < totalBatches - 1) {
-                            await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_BATCHES));
-                          }
-                        } // End of outer loop (batches) - IMMEDIATE MODE
-                        
-                        } // End of else block (IMMEDIATE MODE)
-                        
-                        // Check if all subscriptions were created - if not, add missing ones to failed list for refund
-                        // This applies to both QUEUE MODE and IMMEDIATE MODE
-                        // IMPORTANT: In QUEUE MODE, we should NOT count queued items as "missing" - they will be processed asynchronously
-                        let missingCount = 0;
-                        
-                        if (quantity > USE_QUEUE_THRESHOLD) {
-                          // QUEUE MODE: Only count items that failed to queue or failed to create immediately
-                          // Items that were successfully queued should NOT be counted as missing
-                          const queuedSuccessfully = queuedCount;
-                          const processedImmediately = createdSubscriptionIds.length;
-                          const failedToQueue = queueErrors;
-                          const failedToCreate = failedSubscriptions.length;
-                          
-                          // Missing = total - (queued successfully + processed immediately + failed)
-                          // But we only want to refund items that actually failed, not items that are queued
-                          missingCount = quantity - (queuedSuccessfully + processedImmediately + failedToQueue + failedToCreate);
-                          
-                          if (missingCount > 0) {
-                            console.warn(`[checkout.session.completed] ⚠️ WARNING: ${missingCount} subscription(s) were not processed (webhook may have timed out). Adding to failed list for refund.`);
-                            
-                            // Find which license keys weren't processed (not queued, not created, not failed)
-                            const processedLicenseKeys = new Set([
-                              ...successfulLicenseSubscriptions.map(s => s.licenseKey),
-                              ...failedLicenseKeys
-                            ]);
-                            
-                            // Also check which ones were successfully queued
-                            let queuedLicenseKeys = new Set();
-                            if (env.DB) {
-                              try {
-                                const queuedResult = await env.DB.prepare(
-                                  `SELECT license_key FROM subscription_queue 
-                                   WHERE payment_intent_id = ? AND status = 'pending'`
-                                ).bind(paymentIntent.id).all();
-                                
-                                if (queuedResult.success) {
-                                  queuedLicenseKeys = new Set(queuedResult.results.map(r => r.license_key));
-                                }
-                              } catch (queueCheckErr) {
-                                console.warn(`[checkout.session.completed] ⚠️ Could not check queued items:`, queueCheckErr);
-                              }
-                            }
-                            
-                            for (let i = 0; i < licenseKeys.length; i++) {
-                              // Only add to failed if it wasn't processed AND wasn't queued
-                              if (!processedLicenseKeys.has(licenseKeys[i]) && !queuedLicenseKeys.has(licenseKeys[i])) {
-                                failedSubscriptions.push({ 
-                                  licenseKey: licenseKeys[i], 
-                                  reason: 'not_processed_timeout', 
-                                  index: i + 1 
-                                });
-                                failedLicenseKeys.push(licenseKeys[i]);
-                                console.warn(`[checkout.session.completed] ⚠️ License ${licenseKeys[i]} (subscription ${i + 1}/${quantity}) was not processed - will be refunded`);
-                              }
-                            }
-                          } else {
-                          }
-                        } else {
-                          // IMMEDIATE MODE: Count all items that weren't created
-                          const totalProcessed = createdSubscriptionIds.length + failedSubscriptions.length;
-                          missingCount = quantity - totalProcessed;
-                          
-                          if (missingCount > 0) {
-                            console.warn(`[checkout.session.completed] ⚠️ WARNING: ${missingCount} subscription(s) were not processed (webhook may have timed out). Adding to failed list for refund.`);
-                            
-                            // Find which license keys weren't processed
-                            const processedLicenseKeys = new Set([
-                              ...successfulLicenseSubscriptions.map(s => s.licenseKey),
-                              ...failedLicenseKeys
-                            ]);
-                            
-                            for (let i = 0; i < licenseKeys.length; i++) {
-                              if (!processedLicenseKeys.has(licenseKeys[i])) {
-                                failedSubscriptions.push({ 
-                                  licenseKey: licenseKeys[i], 
-                                  reason: 'not_processed_timeout', 
-                                  index: i + 1 
-                                });
-                                failedLicenseKeys.push(licenseKeys[i]);
-                                console.warn(`[checkout.session.completed] ⚠️ License ${licenseKeys[i]} (subscription ${i + 1}/${quantity}) was not processed - will be refunded`);
-                              }
-                            }
-                          }
-                        }
-                        
-                        // ========================================
-                        // REFUND LOGIC: If any subscriptions failed or weren't processed, refund the failed portion
-                        // ========================================
-                        // REFUND CODE COMMENTED OUT - DO NOT REFUND AUTOMATICALLY
-                        /*
-                        if (failedSubscriptions.length > 0) {
-                          console.warn(`[checkout.session.completed] ⚠️ ${failedSubscriptions.length} subscription(s) failed to create. Processing refund for failed subscriptions...`);
-                          
-                          try {
-                            // Get payment intent charge ID for refund
-                            let chargeId = null;
-                            if (paymentIntent?.latest_charge) {
-                              chargeId = typeof paymentIntent.latest_charge === 'string' 
-                                ? paymentIntent.latest_charge 
-                                : paymentIntent.latest_charge.id;
-                            } else if (paymentIntent?.charges?.data?.length > 0) {
-                              chargeId = paymentIntent.charges.data[0].id;
-                            }
-                            
-                            if (!chargeId && session.payment_intent) {
-                              // Fetch payment intent to get charge
-                              try {
-                                const piRes = await stripeFetch(env, `/payment_intents/${session.payment_intent}`);
-                                if (piRes.status === 200) {
-                                  const pi = piRes.body;
-                                  chargeId = pi.latest_charge || (pi.charges?.data?.[0]?.id);
-                                }
-                              } catch (piErr) {
-                                console.warn(`[checkout.session.completed] Could not fetch payment intent for refund:`, piErr);
-                              }
-                            }
-                            
-                            if (chargeId) {
-                              // Get price details to calculate refund amount
-                              let refundAmount = 0;
-                              let currency = 'usd';
-                              
-                              try {
-                                const priceRes = await stripeFetch(env, `/prices/${priceId}`);
-                                if (priceRes.status === 200) {
-                                  const price = priceRes.body;
-                                  const unitPrice = price.unit_amount || 0;
-                                  currency = price.currency || 'usd';
-                                  refundAmount = unitPrice * failedSubscriptions.length;
-                                }
-                              } catch (priceErr) {
-                                console.warn(`[checkout.session.completed] ⚠️ Could not get price for refund calculation:`, priceErr);
-                                // Fallback: Use payment intent amount divided by quantity
-                                if (paymentIntent?.amount && quantity > 0) {
-                                  refundAmount = Math.round((paymentIntent.amount / quantity) * failedSubscriptions.length);
-                                  currency = paymentIntent.currency || 'usd';
-                                }
-                              }
-                              
-                              if (refundAmount > 0) {
-                                // Create refund
-                                const refundRes = await stripeFetch(env, '/refunds', 'POST', {
-                                  'charge': chargeId,
-                                  'amount': refundAmount,
-                                  'metadata[reason]': 'subscription_creation_failed',
-                                  'metadata[failed_count]': failedSubscriptions.length.toString(),
-                                  'metadata[failed_license_keys]': JSON.stringify(failedLicenseKeys)
-                                }, true);
-                                
-                                if (refundRes.status === 200) {
-                                  const refund = refundRes.body;
-                                  
-                                  // Save refund record to database
-                                  if (env.DB) {
-                                    try {
-                                      const timestamp = Math.floor(Date.now() / 1000);
-                                      await env.DB.prepare(
-                                        `INSERT INTO refunds (
-                                          refund_id, payment_intent_id, charge_id, customer_id, user_email,
-                                          amount, currency, status, reason, queue_id, license_key,
-                                          subscription_id, attempts, metadata, created_at, updated_at
-                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                                      ).bind(
-                                        refund.id,
-                                        paymentIntent?.id || session.payment_intent,
-                                        chargeId,
-                                        customerIdForSubscriptions,
-                                        session.customer_email || null,
-                                        refundAmount,
-                                        currency,
-                                        refund.status || 'succeeded',
-                                        'subscription_creation_failed',
-                                        null, // queue_id (not from queue)
-                                        null, // license_key (multiple licenses)
-                                        null, // subscription_id (not created)
-                                        null, // attempts
-                                        JSON.stringify({
-                                          reason: 'subscription_creation_failed',
-                                          failed_count: failedSubscriptions.length,
-                                          payment_intent_id: paymentIntent?.id || session.payment_intent,
-                                          customer_id: customerIdForSubscriptions
-                                        }),
-                                        timestamp,
-                                        timestamp
-                                      ).run();
-                                    } catch (refundDbErr) {
-                                      if (refundDbErr.message && refundDbErr.message.includes('UNIQUE constraint')) {
-                                        console.warn(`[checkout.session.completed] ⚠️ Refund ${refund.id} already exists in database, skipping`);
-                                      } else {
-                                        console.error(`[checkout.session.completed] ⚠️ Error saving refund record:`, refundDbErr);
-                                      }
-                                    }
-                                  }
-                                } else {
-                                  console.error(`[checkout.session.completed] ❌ Failed to create refund:`, refundRes.status, refundRes.body);
-                                }
-                              } else {
-                                console.warn(`[checkout.session.completed] ⚠️ Refund amount is 0, skipping refund creation`);
-                              }
-                            } else {
-                              console.error(`[checkout.session.completed] ❌ Could not find charge ID for refund. PaymentIntent: ${paymentIntent?.id || 'N/A'}, Session payment_intent: ${session.payment_intent || 'N/A'}`);
-                            }
-                          } catch (refundErr) {
-                            console.error(`[checkout.session.completed] ❌ Error processing refund:`, refundErr);
-                          }
-                        }
-                        */
-                        
-                        // Log failed subscriptions without refunding
-                        if (failedSubscriptions.length > 0) {
-                          console.warn(`[checkout.session.completed] ⚠️ ${failedSubscriptions.length} subscription(s) failed to create. Refund code is disabled - manual review required.`);
-                        }
-                      } catch (createSubsErr) {
-                        console.error('[checkout.session.completed] ❌ Error creating separate subscriptions:', createSubsErr);
-                      }
-                    } else {
-                      // Log why subscriptions aren't being created
-                      if (!paymentMethodSaved) {
-                        console.error(`[checkout.session.completed] ❌ STEP 2 SKIPPED: Payment method was not saved successfully`);
-                      }
-                      if (!priceId) {
-                        console.error(`[checkout.session.completed] ❌ STEP 2 SKIPPED: Missing priceId`);
-                      }
-                      if (!quantity || quantity <= 0) {
-                        console.error(`[checkout.session.completed] ❌ STEP 2 SKIPPED: Invalid quantity: ${quantity}`);
-                      }
-                      if (!customerIdForSubscriptions) {
-                        console.error(`[checkout.session.completed] ❌ STEP 2 SKIPPED: Missing customerId`);
-                      }
-                    }
-                    
-                    // Create license keys in database - ONLY for successfully created subscriptions
-                    if (env.DB && successfulLicenseSubscriptions.length > 0) {
-                      const timestamp = Math.floor(Date.now() / 1000);
-                      
-                      for (const licenseSub of successfulLicenseSubscriptions) {
-                        const { licenseKey, subscriptionId, itemId } = licenseSub;
-                        
-                        try {
-                          const existingLicense = await env.DB.prepare(
-                            `SELECT license_key FROM licenses WHERE license_key = ?`
-                          ).bind(licenseKey).first();
-                          
-                          if (existingLicense) {
-                            console.warn(`[checkout.session.completed] ⚠️ License key ${licenseKey} already exists, skipping`);
-                            continue;
-                          }
-                          
-                          await env.DB.prepare(
-                            `INSERT INTO licenses 
-                             (license_key, customer_id, subscription_id, item_id, 
-                              site_domain, used_site_domain, status, purchase_type, created_at, updated_at)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                          ).bind(
-                            licenseKey,
-                            useCase3CustomerId,
-                            subscriptionId,
-                            itemId || null,
-                            null,
-                            null,
-                            'active',
-                            'quantity',
-                            timestamp,
-                            timestamp
-                          ).run();
-                          
-                        } catch (insertErr) {
-                          if (insertErr.message && insertErr.message.includes('UNIQUE constraint')) {
-                            console.warn(`[checkout.session.completed] ⚠️ License key ${licenseKey} already exists, skipping`);
-                          } else {
-                            console.error(`[checkout.session.completed] ❌ Error storing license ${licenseKey}:`, insertErr);
-                          }
-                        }
-                      }
-                    } else if (env.DB && licenseKeys.length > 0 && successfulLicenseSubscriptions.length === 0) {
-                      console.warn(`[checkout.session.completed] ⚠️ No subscriptions were created successfully - skipping license key storage. ${failedSubscriptions.length} subscription(s) failed.`);
-                    }
-                    
-                    // Save payment records
-                    if (env.DB && createdSubscriptionIds.length > 0) {
-                      try {
-                        const timestamp = Math.floor(Date.now() / 1000);
-                        const quantityForPayment = parseInt(metadata.quantity) || licenseKeys.length || 1;
-                        const totalAmount = paymentIntent.amount || 0;
-                        const amountPerSubscription = Math.round(totalAmount / quantityForPayment);
-                        const currency = paymentIntent.currency || 'usd';
-                        
-                        for (let i = 0; i < createdSubscriptionIds.length; i++) {
-                          await env.DB.prepare(
-                            `INSERT INTO payments (
-                              customer_id, subscription_id, email, amount, currency, 
-                              status, site_domain, magic_link, magic_link_generated, 
-                              created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                          ).bind(
-                            useCase3CustomerId,
-                            createdSubscriptionIds[i],
-                            userEmail,
-                            amountPerSubscription,
-                            currency,
-                            'succeeded',
-                            null,
-                            null,
-                            0,
-                            timestamp,
-                            timestamp
-                          ).run();
-                        }
-                        
-                      } catch (paymentErr) {
-                        console.error('[checkout.session.completed] ❌ Error saving payment record:', paymentErr);
-                      }
-                    }
-                    
-                    return new Response('ok');
-                  }
+                const customerRes = await stripeFetch(env, `/customers/${useCase3CustomerId}`);
+                if (
+                  customerRes.status === 200 &&
+                  customerRes.body.metadata?.license_keys_pending
+                ) {
+                  licenseKeys = JSON.parse(
+                    customerRes.body.metadata.license_keys_pending
+                  );
+                  console.log(
+                    `[checkout.session.completed] ✅ Retrieved ${licenseKeys.length} license keys from customer metadata`
+                  );
                 }
-              } catch (piErr) {
-                console.error(`[checkout.session.completed] Error fetching payment_intent for Use Case 3:`, piErr);
+              } catch (customerErr) {
+                console.error(
+                  `[checkout.session.completed] ❌ Error fetching license keys from customer metadata:`,
+                  customerErr
+                );
               }
             }
-            
-            // If payment_intent fetch failed or metadata.usecase is not '3', return early
-            // This ensures Use Case 3 doesn't fall through to Use Case 1 processing
+          } catch (e) {
+            console.error(
+              `[checkout.session.completed] Error parsing license_keys:`,
+              e
+            );
+          }
+
+          // If still empty, try again (same logic, but keep as is for idempotency)
+          if (licenseKeys.length === 0) {
+            console.warn(
+              `[checkout.session.completed] ⚠️ No license_keys found in metadata. Available keys: ${Object.keys(
+                metadata
+              ).join(', ')}`
+            );
+          }
+
+          // 4) Basic idempotency check: if at least first license already exists, exit
+          if (env.DB && licenseKeys.length > 0) {
+            try {
+              const existingLicenseCheck = await env.DB.prepare(
+                `SELECT license_key FROM licenses WHERE license_key = ? LIMIT 1`
+              )
+                .bind(licenseKeys[0])
+                .first();
+              if (existingLicenseCheck) {
+                console.log(
+                  `[checkout.session.completed] ℹ️ Use Case 3 already processed (license ${licenseKeys[0]} exists), returning early.`
+                );
+                return new Response('ok');
+              }
+            } catch (checkErr) {
+              console.warn(
+                `[checkout.session.completed] Could not check existing licenses:`,
+                checkErr
+              );
+            }
+          }
+
+          // 5) Resolve user email
+          const userEmail = await getCustomerEmail(env, useCase3CustomerId);
+          if (!userEmail) {
+            console.warn(
+              '[checkout.session.completed] User email not found for Use Case 3'
+            );
             return new Response('ok');
           }
+
+          // 6) Resolve priceId (from metadata → product → billing_period)
+          let priceId=null;
+          let quantity = parseInt(metadata.quantity) || licenseKeys.length || 1;
+          const productIdFromMetadata = metadata.product_id || null;
+          let productIdFromCustomer= null;
+
+          console.log(
+            `[checkout.session.completed] 📋 Metadata keys: ${Object.keys(metadata).join(
+              ', '
+            )}`
+          );
+          if (productIdFromMetadata) {
+            console.log(
+              `[checkout.session.completed] 🆔 Product ID from metadata: ${productIdFromMetadata}`
+            );
+          }
+
+          try {
+            // Re-load keys if needed (same as above, safe)
+            if (metadata.license_keys) {
+              licenseKeys = JSON.parse(metadata.license_keys);
+            } else if (
+              metadata.license_keys_source === 'customer_metadata' ||
+              metadata.license_keys_count
+            ) {
+              if (licenseKeys.length === 0) {
+                try {
+                  const customerRes = await stripeFetch(env, `/customers/${useCase3CustomerId}`);
+                  if (
+                    customerRes.status === 200 &&
+                    customerRes.body.metadata?.license_keys_pending
+                  ) {
+                    licenseKeys = JSON.parse(
+                      customerRes.body.metadata.license_keys_pending
+                    );
+                    console.log(
+                      `[checkout.session.completed] ✅ Retrieved ${licenseKeys.length} license keys from customer metadata`
+                    );
+                  }
+                  if (!productIdFromMetadata && customerRes.body.metadata?.product_id) {
+                    productIdFromCustomer = customerRes.body.metadata.product_id;
+                    console.log(
+                      `[checkout.session.completed] 🆔 Product ID from customer metadata: ${productIdFromCustomer}`
+                    );
+                  }
+                } catch (customerErr) {
+                  console.error(
+                    `[checkout.session.completed] ❌ Error fetching license keys from customer metadata:`,
+                    customerErr
+                  );
+                }
+              }
+            } else {
+              console.warn(
+                `[checkout.session.completed] ⚠️ No license_keys found in metadata.`
+              );
+            }
+
+            priceId = metadata.price_id || null;
+            quantity = parseInt(metadata.quantity) || licenseKeys.length || 0;
+
+            const productIdToUse = productIdFromMetadata || productIdFromCustomer;
+
+            // If price_id not in metadata, try via product
+            if (!priceId && productIdToUse) {
+              console.log(
+                `[checkout.session.completed] 🔍 price_id not found, fetching from product_id: ${productIdToUse}`
+              );
+              try {
+                const productRes = await stripeFetch(env, `/products/${productIdToUse}`);
+                if (productRes.status === 200 && productRes.body) {
+                  const pricesRes = await stripeFetch(
+                    env,
+                    `/prices?product=${productIdToUse}&active=true&limit=1`
+                  );
+                  if (pricesRes.status === 200 && pricesRes.body?.data?.length > 0) {
+                    priceId = pricesRes.body.data[0].id;
+                    console.log(
+                      `[checkout.session.completed] ✅ Found price_id from product: ${priceId}`
+                    );
+                  } else {
+                    console.warn(
+                      `[checkout.session.completed] ⚠️ No active prices found for product: ${productIdToUse}`
+                    );
+                  }
+                }
+              } catch (productErr) {
+                console.error(
+                  `[checkout.session.completed] ❌ Error fetching price_id from product_id:`,
+                  productErr
+                );
+              }
+            }
+
+            // Fallback: by billing_period
+            if (!priceId && metadata.billing_period) {
+              console.log(
+                `[checkout.session.completed] 🔍 Trying to get price_id from billing_period: ${metadata.billing_period}`
+              );
+              try {
+                priceId = await getPriceIdByBillingPeriod(env, metadata.billing_period);
+                if (priceId) {
+                  console.log(
+                    `[checkout.session.completed] ✅ Found price_id from billing_period: ${priceId}`
+                  );
+                }
+              } catch (billingErr) {
+                console.error(
+                  `[checkout.session.completed] ❌ Error getting price_id from billing_period:`,
+                  billingErr
+                );
+              }
+            }
+          } catch (parseErr) {
+            console.error(
+              '[checkout.session.completed] ❌ Error parsing metadata:',
+              parseErr
+            );
+          }
+
+          // 7) Save payment method to customer (unchanged)
+          let paymentMethodId = paymentIntent.payment_method;
+
+          if (!paymentMethodId && paymentIntent.latest_charge) {
+            try {
+              const chargeRes = await stripeFetch(env, `/charges/${paymentIntent.latest_charge}`);
+              if (chargeRes.status === 200 && chargeRes.body.payment_method) {
+                paymentMethodId = chargeRes.body.payment_method;
+              }
+            } catch (chargeErr) {
+              console.warn(
+                `[checkout.session.completed] Could not fetch charge for payment method:`,
+                chargeErr
+              );
+            }
+          }
+
+          const customerIdForPaymentMethod =
+            session.customer || paymentIntent.customer || useCase3CustomerId;
+
+          let paymentMethodSaved = false;
+
+          if (paymentMethodId && customerIdForPaymentMethod) {
+            try {
+              const attachRes = await stripeFetch(
+                env,
+                `/payment_methods/${paymentMethodId}/attach`,
+                'POST',
+                { customer: customerIdForPaymentMethod },
+                true
+              );
+
+              if (attachRes.status === 200) {
+                const setDefaultRes = await stripeFetch(
+                  env,
+                  `/customers/${customerIdForPaymentMethod}`,
+                  'POST',
+                  { 'invoice_settings[default_payment_method]': paymentMethodId },
+                  true
+                );
+                if (setDefaultRes.status === 200) {
+                  paymentMethodSaved = true;
+                } else {
+                  console.warn(
+                    `[checkout.session.completed] ⚠️ Payment method attached but failed to set as default:`,
+                    setDefaultRes.status,
+                    setDefaultRes.body
+                  );
+                }
+              } else {
+                const errorMessage = attachRes.body?.error?.message || '';
+                if (
+                  errorMessage.includes('already attached') ||
+                  errorMessage.includes('already been attached')
+                ) {
+                  const setDefaultRes = await stripeFetch(
+                    env,
+                    `/customers/${customerIdForPaymentMethod}`,
+                    'POST',
+                    { 'invoice_settings[default_payment_method]': paymentMethodId },
+                    true
+                  );
+                  if (setDefaultRes.status === 200) {
+                    paymentMethodSaved = true;
+                  } else {
+                    console.warn(
+                      `[checkout.session.completed] ⚠️ Failed to set payment method as default:`,
+                      setDefaultRes.status,
+                      setDefaultRes.body
+                    );
+                  }
+                } else {
+                  console.error(
+                    `[checkout.session.completed] ❌ STEP 1 FAILED: Failed to attach payment method:`,
+                    attachRes.status,
+                    attachRes.body
+                  );
+                }
+              }
+            } catch (attachErr) {
+              console.error(
+                `[checkout.session.completed] ❌ STEP 1 FAILED: Error attaching payment method:`,
+                attachErr
+              );
+            }
+          } else {
+            console.error(
+              `[checkout.session.completed] ❌ STEP 1 FAILED: Missing payment_method or customer. payment_method: ${paymentMethodId}, customer: ${customerIdForPaymentMethod}`
+            );
+          }
+
+          // 8) ALWAYS QUEUE: no immediate subscription creation, no thresholds
+          const customerIdForSubscriptions =
+            customerIdForPaymentMethod || session.customer || useCase3CustomerId;
+
+          if (paymentMethodSaved && priceId && quantity > 0 && customerIdForSubscriptions) {
+            try {
+              // Calculate single trial_end for all future subscriptions
+              const now = Math.floor(Date.now() / 1000);
+
+              let trialPeriodDays = null;
+              if (env.TRIAL_PERIOD_DAYS) {
+                trialPeriodDays = parseInt(env.TRIAL_PERIOD_DAYS);
+              } else if (session.metadata?.trial_period_days) {
+                trialPeriodDays = parseInt(session.metadata.trial_period_days);
+              }
+
+              let trialPeriodSeconds = 30 * 24 * 60 * 60;
+              let billingInterval = 'month';
+
+              if (trialPeriodDays) {
+                trialPeriodSeconds = trialPeriodDays * 24 * 60 * 60;
+              } else {
+                try {
+                  const priceRes = await stripeFetch(env, `/prices/${priceId}`);
+                  if (priceRes.status === 200 && priceRes.body.recurring) {
+                    billingInterval = priceRes.body.recurring.interval;
+                    const intervalCount = priceRes.body.recurring.interval_count || 1;
+                    if (billingInterval === 'week') {
+                      trialPeriodSeconds = 7 * 24 * 60 * 60 * intervalCount;
+                    } else if (billingInterval === 'month') {
+                      trialPeriodSeconds = 30 * 24 * 60 * 60 * intervalCount;
+                    } else if (billingInterval === 'year') {
+                      trialPeriodSeconds = 365 * 24 * 60 * 60 * intervalCount;
+                    } else if (billingInterval === 'day') {
+                      trialPeriodSeconds = 24 * 60 * 60 * intervalCount;
+                    }
+                  }
+                } catch (priceErr) {
+                  console.warn(
+                    `[checkout.session.completed] ⚠️ Could not fetch price details, using default 30 days:`,
+                    priceErr
+                  );
+                }
+              }
+
+              const trialEndTime = now + trialPeriodSeconds;
+              const minimumTrialEnd =
+                billingInterval === 'day'
+                  ? now + 7 * 24 * 60 * 60
+                  : now + 3600;
+              const trialEnd = Math.max(trialEndTime, minimumTrialEnd);
+
+              // LICENSE KEYS: if for some reason metadata had count but not actual array,
+              // generate temporary keys so queue has one per subscription.
+              if (!licenseKeys || licenseKeys.length === 0) {
+                const count = quantity || 0;
+                licenseKeys = await generateTempLicenseKeys(count);
+                console.log(
+                  `[USE CASE 3] Generated ${licenseKeys.length} temporary license keys because none were found in metadata`
+                );
+              }
+
+              if (licenseKeys.length !== quantity) {
+                console.warn(
+                  `[USE CASE 3] ⚠️ licenseKeys.length (${licenseKeys.length}) != quantity (${quantity}). Will queue min(count) items.`
+                );
+              }
+
+              const toQueue = Math.min(licenseKeys.length, quantity);
+              let queuedCount = 0;
+              let queueErrors = 0;
+
+              console.log(
+                `[USE CASE 3 - QUEUE ONLY] 📋 Adding ${toQueue} items to subscription_queue...`
+              );
+
+              for (let i = 0; i < toQueue; i++) {
+                const queueResult = await addToSubscriptionQueue(env, {
+                  customerId: customerIdForSubscriptions,
+                  userEmail,
+                  paymentIntentId: paymentIntent.id,
+                  priceId,
+                  licenseKey: licenseKeys[i],
+                  quantity: 1,
+                  trialEnd,
+                });
+
+                if (queueResult.success) {
+                  queuedCount++;
+                  if ((i + 1) % 10 === 0 || i === toQueue - 1) {
+                    console.log(
+                      `[USE CASE 3 - QUEUE ONLY] ✅ Queued ${i + 1}/${toQueue} items (${queuedCount} successful, ${queueErrors} errors)`
+                    );
+                  }
+                } else {
+                  queueErrors++;
+                  console.error(
+                    `[USE CASE 3 - QUEUE ONLY] ❌ Failed to queue item ${i + 1}/${toQueue} for license ${licenseKeys[i]}:`,
+                    queueResult.error
+                  );
+                }
+              }
+
+              console.log(
+                `[USE CASE 3 - QUEUE ONLY] 📊 Queue Summary: ${queuedCount} queued successfully, ${queueErrors} failed out of ${toQueue} planned`
+              );
+
+              // No subscription creation here. Background worker / cron will call processQueueItem()
+              // for each pending row and:
+              //  - generate real license key if temporary
+              //  - create subscription in Stripe
+              //  - create license row in DB
+              //  - mark queue row as completed or delete it
+
+            } catch (queueErr) {
+              console.error(
+                '[checkout.session.completed] ❌ Error queuing subscriptions for Use Case 3:',
+                queueErr
+              );
+            }
+          } else {
+            // Explain why nothing was queued
+            if (!paymentMethodSaved) {
+              console.error(
+                `[checkout.session.completed] ❌ QUEUE STEP SKIPPED: Payment method was not saved successfully`
+              );
+            }
+            if (!priceId) {
+              console.error(
+                `[checkout.session.completed] ❌ QUEUE STEP SKIPPED: Missing priceId`
+              );
+            }
+            if (!quantity || quantity <= 0) {
+              console.error(
+                `[checkout.session.completed] ❌ QUEUE STEP SKIPPED: Invalid quantity: ${quantity}`
+              );
+            }
+            if (!customerIdForSubscriptions) {
+              console.error(
+                `[checkout.session.completed] ❌ QUEUE STEP SKIPPED: Missing customerId`
+              );
+            }
+          }
+
+          // IMPORTANT: no immediate creation, no license DB writes here.
+          // Everything happens in queue processor.
+
+          return new Response('ok');
+        }
+      }
+    } catch (piErr) {
+      console.error(
+        `[checkout.session.completed] Error fetching payment_intent for Use Case 3:`,
+        piErr
+      );
+    }
+  }
+
+  // If payment_intent fetch failed or metadata.usecase is not '3', return early
+  // This ensures Use Case 3 doesn't fall through to Use Case 1 processing
+  return new Response('ok');
+}
+
           
           // ========================================
           // USE CASE 1 HANDLER: Direct Payment Links
@@ -2967,11 +3588,7 @@ export default {
           
           const isUseCase1 = !addToExisting || !existingSubscriptionId || isDirectLink;
           
-          // CRITICAL: Keep items separate by purchase type
-          // Quantity purchases can add to existing subscription, but items are tagged separately
-          // Site purchases should not add to quantity subscriptions (but quantity can add to site subscriptions)
-          
-          // Check if existing subscription is a quantity subscription when adding site purchase
+         
           if (addToExisting && existingSubscriptionId && purchaseType !== 'quantity') {
             try {
               const existingSubRes = await stripeFetch(env, `/subscriptions/${existingSubscriptionId}`);
@@ -2986,11 +3603,7 @@ export default {
             }
           }
           
-          // For quantity purchases, allow adding to existing subscription
-          // Items will be tagged with purchase_type: 'quantity' in metadata to keep them separate
-          if (purchaseType === 'quantity' && addToExisting && existingSubscriptionId) {
-          }
-          
+        
           if (addToExisting && existingSubscriptionId) {
             
             // Get the existing subscription and verify it's active
@@ -3186,12 +3799,16 @@ export default {
                         ).bind(customerId, site, 'active').first();
                         
                         if (!existingLicense) {
-                          const licenseKey = generateLicenseKey();
+                          const licenseKey = await generateUniqueLicenseKey(env);
                           const timestamp = Math.floor(Date.now() / 1000);
+                          // CRITICAL: For site-based purchases, set both site_domain and used_site_domain to the same site
+                          // This marks the license as "used" and tied to this specific site - cannot be reused
                           await env.DB.prepare(
-                            'INSERT INTO licenses (customer_id, subscription_id, item_id, site_domain, license_key, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-                          ).bind(customerId, existingSubscriptionId, newItem.id, site, licenseKey, 'active', timestamp, timestamp).run();
+                            'INSERT INTO licenses (customer_id, subscription_id, item_id, site_domain, used_site_domain, license_key, status, purchase_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                          ).bind(customerId, existingSubscriptionId, newItem.id, site, site, licenseKey, 'active', 'site', timestamp, timestamp).run();
+                          console.log(`[add-site] ✅ Created site-based license ${licenseKey} for site ${site} (marked as used)`);
                         } else {
+                          console.log(`[add-site] ℹ️ License already exists for site ${site}, skipping creation`);
                         }
                       } catch (licenseError) {
                         console.error(`Failed to generate license for site ${site}:`, licenseError);
@@ -3233,74 +3850,76 @@ export default {
               // Remove pending sites that were just added
               // Match by site name (case-insensitive) or by checking if site is now in user.sites
               if (user.pendingSites && user.pendingSites.length > 0) {
+                // STEP 1: Get list of added sites BEFORE filtering user.pendingSites
                 const addedSites = sub.items.data.map((item, idx) => {
                   const siteFromMeta = sitesFromMetadata[idx] || `site_${idx + 1}`;
                   // Also check item metadata for site name
                   const siteFromItem = item.metadata?.site;
-                  return siteFromItem || siteFromMeta;
+                  return (siteFromItem || siteFromMeta).toLowerCase().trim();
                 });
                 
                 // Also get sites that are now in user.sites (they were successfully added)
-                const sitesInUserRecord = Object.keys(user.sites || {});
+                const sitesInUserRecord = Object.keys(user.sites || {}).map(s => s.toLowerCase().trim());
                 
                 // Get all sites that were just added (from the items we just added to existing subscription)
                 const justAddedSites = [];
                 for (let idx = 0; idx < sub.items.data.length; idx++) {
                   const site = sitesFromMetadata[idx] || `site_${idx + 1}`;
-                  justAddedSites.push(site);
+                  justAddedSites.push(site.toLowerCase().trim());
                 }
                 
+                // Combine all added sites (from subscription items, just added sites, and user.sites)
+                const allAddedSites = [...new Set([...addedSites, ...justAddedSites, ...sitesInUserRecord])];
                 
+                // STEP 2: Delete pending sites from database FIRST (before filtering user.pendingSites)
+                // This ensures we delete ALL added sites, even if they're removed from user.pendingSites during filtering
+                if (env.DB && allAddedSites.length > 0) {
+                  console.log(`[${operationId}] 🗑️ Removing ${allAddedSites.length} pending site(s) from database (add to existing):`, allAddedSites);
+                  for (const addedSite of allAddedSites) {
+                    try {
+                      const deleteResult = await env.DB.prepare(
+                        'DELETE FROM pending_sites WHERE user_email = ? AND LOWER(TRIM(site_domain)) = ?'
+                      ).bind(email, addedSite).run();
+                      if (deleteResult.success) {
+                        console.log(`[${operationId}] ✅ Deleted pending site from database: ${addedSite}`);
+                      } else {
+                        console.warn(`[${operationId}] ⚠️ Delete query succeeded but no rows affected for: ${addedSite}`);
+                      }
+                    } catch (dbError) {
+                      console.error(`[${operationId}] ❌ Failed to remove pending site ${addedSite} from database:`, dbError);
+                    }
+                  }
+                }
+                
+                // STEP 3: Now filter user.pendingSites to remove added sites
                 const beforeCount = user.pendingSites.length;
                 
                 // Remove pending sites that match any added site (case-insensitive)
                 // Also remove if the site is now in user.sites (was successfully added)
                 user.pendingSites = user.pendingSites.filter(pending => {
-                  const pendingSiteLower = pending.site.toLowerCase().trim();
-                  const isAdded = addedSites.some(added => added.toLowerCase().trim() === pendingSiteLower) ||
-                                  justAddedSites.some(added => added.toLowerCase().trim() === pendingSiteLower) ||
-                                  sitesInUserRecord.some(site => site.toLowerCase().trim() === pendingSiteLower);
+                  const pendingSiteLower = (pending.site || pending.site_domain || pending).toLowerCase().trim();
+                  const isAdded = allAddedSites.includes(pendingSiteLower);
                   if (isAdded) {
+                    console.log(`[${operationId}] 🗑️ Removing pending site from user object: ${pendingSiteLower}`);
                   }
                   return !isAdded;
                 });
                 
                 const afterCount = user.pendingSites.length;
+                console.log(`[${operationId}] 🗑️ Pending sites (add to existing): ${beforeCount} → ${afterCount} (removed ${beforeCount - afterCount})`);
+                
                 if (afterCount > 0) {
                   // If we added sites but pending sites remain, they might be from a different source
                   // Remove any pending sites that are now in user.sites (double-check)
                   const stillPending = user.pendingSites.filter(pending => {
-                    const pendingSiteLower = pending.site.toLowerCase().trim();
-                    const isNowActive = sitesInUserRecord.some(site => site.toLowerCase().trim() === pendingSiteLower);
+                    const pendingSiteLower = (pending.site || pending.site_domain || pending).toLowerCase().trim();
+                    const isNowActive = sitesInUserRecord.includes(pendingSiteLower);
                     if (isNowActive) {
+                      console.log(`[${operationId}] 🗑️ Removing pending site (double-check): ${pendingSiteLower}`);
                     }
                     return !isNowActive;
                   });
                   user.pendingSites = stillPending;
-                }
-              } else {
-              }
-              
-              // Remove pending sites from database
-              if (env.DB && user.pendingSites && user.pendingSites.length > 0) {
-                const sitesToRemove = user.pendingSites.filter(pending => {
-                  const pendingSiteLower = (pending.site || pending).toLowerCase().trim();
-                  const addedSites = sub.items.data.map((item, idx) => {
-                    const siteFromMeta = sitesFromMetadata[idx] || `site_${idx + 1}`;
-                    return siteFromMeta.toLowerCase().trim();
-                  });
-                  return addedSites.includes(pendingSiteLower);
-                });
-                
-                for (const pending of sitesToRemove) {
-                  const siteToRemove = (pending.site || pending).toLowerCase().trim();
-                  try {
-                    await env.DB.prepare(
-                      'DELETE FROM pending_sites WHERE user_email = ? AND LOWER(TRIM(site_domain)) = ?'
-                    ).bind(email, siteToRemove).run();
-                  } catch (dbError) {
-                    console.error(`[${operationId}] Failed to remove pending site from database:`, dbError);
-                  }
                 }
               }
               
@@ -3674,74 +4293,299 @@ export default {
                 console.error(`[${operationId}] ❌ Failed to save to email-based structure:`, emailStructureError);
                 // Don't fail the entire operation - legacy structure is still saved
               }
+              
+              // CRITICAL: Explicitly save subscription_items to database for site purchases (Use Case 2)
+              // This ensures subscription_items are saved even if addOrUpdateCustomerInUser has issues
+              console.log(`[${operationId}] 💾 Explicitly saving ${itemsToSave.length} subscription item(s) to database for site purchases...`);
+              for (const item of itemsToSave) {
+                try {
+                  console.log(`[${operationId}] 💾 Saving subscription item to database: ${item.item_id} (site: ${item.site || item.site_domain})`);
+                  
+                  // Try with price_id column first (newer schema)
+                  try {
+                    await env.DB.prepare(
+                      `INSERT OR REPLACE INTO subscription_items 
+                       (subscription_id, item_id, site_domain, price_id, quantity, status, created_at, updated_at, removed_at) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                    ).bind(
+                      subscriptionId,
+                      item.item_id,
+                      item.site || item.site_domain || '',
+                      item.price || item.price_id,
+                      item.quantity || 1,
+                      item.status || 'active',
+                      item.created_at || Math.floor(Date.now() / 1000),
+                      Math.floor(Date.now() / 1000),
+                      null
+                    ).run();
+                    console.log(`[${operationId}] ✅ Saved subscription item: ${item.item_id} (with price_id column)`);
+                  } catch (priceIdError) {
+                    // If price_id column doesn't exist, try without it (older schema)
+                    if (priceIdError.message && priceIdError.message.includes('no such column: price_id')) {
+                      console.log(`[${operationId}] ⚠️ price_id column not found, trying without it...`);
+                      await env.DB.prepare(
+                        `INSERT OR REPLACE INTO subscription_items 
+                         (subscription_id, item_id, site_domain, quantity, status, created_at, updated_at, removed_at) 
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+                      ).bind(
+                        subscriptionId,
+                        item.item_id,
+                        item.site || item.site_domain || '',
+                        item.quantity || 1,
+                        item.status || 'active',
+                        item.created_at || Math.floor(Date.now() / 1000),
+                        Math.floor(Date.now() / 1000),
+                        null
+                      ).run();
+                      console.log(`[${operationId}] ✅ Saved subscription item: ${item.item_id} (without price_id column)`);
+                    } else {
+                      throw priceIdError; // Re-throw if it's a different error
+                    }
+                  }
+                } catch (itemError) {
+                  console.error(`[${operationId}] ❌ Failed to save subscription item ${item.item_id} to database:`, itemError);
+                  // Continue with other items even if one fails
+                }
+              }
+              console.log(`[${operationId}] ✅ Finished explicitly saving subscription items for site purchases`);
             }
 
+            // CRITICAL: Reload user object to get fresh pending sites from database
+            // This ensures we have the latest pending sites that might have been added just before checkout
+            console.log(`[${operationId}] 🔍 STEP 1: Checking for pending sites to remove...`);
+            let freshUser = await getUserByEmail(env, email);
+            if (freshUser && freshUser.pendingSites && freshUser.pendingSites.length > 0) {
+              // Use fresh user's pending sites
+              console.log(`[${operationId}] 🔄 Reloaded user object - found ${freshUser.pendingSites.length} pending site(s) in database:`, freshUser.pendingSites.map(ps => ({ site: ps.site || ps.site_domain, price: ps.price || ps.price_id })));
+              user.pendingSites = freshUser.pendingSites;
+            } else if (user.pendingSites && user.pendingSites.length > 0) {
+              console.log(`[${operationId}] ⚠️ Using existing user object - found ${user.pendingSites.length} pending site(s):`, user.pendingSites.map(ps => ({ site: ps.site || ps.site_domain, price: ps.price || ps.price_id })));
+            } else {
+              console.log(`[${operationId}] ℹ️ No pending sites found in user object`);
+            }
+            
             // Remove pending sites that were just added (for new subscription flow)
             if (user.pendingSites && user.pendingSites.length > 0) {
+              console.log(`[${operationId}] 🔍 STEP 2: Processing ${user.pendingSites.length} pending site(s) for removal...`);
+              // STEP 1: Get list of added sites BEFORE filtering user.pendingSites
+              console.log(`[${operationId}] 🔍 STEP 2.1: Extracting site names from subscription items...`);
               const addedSites = sub.items.data.map((item, index) => {
                 const siteFromMeta = sitesFromMetadata[index] || `site_${index + 1}`;
                 // Also check item metadata for site name
                 const siteFromItem = item.metadata?.site;
-                return siteFromItem || siteFromMeta;
+                const finalSite = (siteFromItem || siteFromMeta).toLowerCase().trim();
+                console.log(`[${operationId}]   - Item ${index}: metadata=${siteFromItem}, subscriptionMeta=${sitesFromMetadata[index]}, final=${finalSite}`);
+                return finalSite;
               });
+              console.log(`[${operationId}] ✅ Extracted ${addedSites.length} site(s) from subscription items:`, addedSites);
               
               // Also get sites that are now in user.sites (they were successfully added)
-              const sitesInUserRecord = Object.keys(user.sites || {});
+              const sitesInUserRecord = Object.keys(user.sites || {}).map(s => s.toLowerCase().trim());
+              console.log(`[${operationId}] ✅ Found ${sitesInUserRecord.length} site(s) in user.sites:`, sitesInUserRecord);
               
+              // CRITICAL: Also check pending sites - if a pending site matches this subscription's price,
+              // it was likely just purchased, so include it in the removal list
+              // This handles cases where the site name isn't in subscription metadata yet
+              console.log(`[${operationId}] 🔍 STEP 2.2: Matching pending sites by price ID...`);
+              const pendingSitesToRemove = [];
+              if (sub.items && sub.items.data && sub.items.data.length > 0) {
+                const subscriptionPriceId = sub.items.data[0].price.id;
+                console.log(`[${operationId}]   - Subscription price ID: ${subscriptionPriceId}`);
+                user.pendingSites.forEach((pending, idx) => {
+                  const pendingPrice = pending.price || pending.price_id;
+                  const pendingSiteName = (pending.site || pending.site_domain || '').toLowerCase().trim();
+                  console.log(`[${operationId}]   - Pending site ${idx + 1}: ${pendingSiteName}, price: ${pendingPrice}`);
+                  // If pending site has the same price as this subscription, it was likely just purchased
+                  if (pendingPrice === subscriptionPriceId) {
+                    if (pendingSiteName && !pendingSiteName.startsWith('site_')) {
+                      console.log(`[${operationId}]   ✅ MATCH by price: ${pendingSiteName} (price: ${pendingPrice})`);
+                      pendingSitesToRemove.push(pendingSiteName);
+                    } else {
+                      console.log(`[${operationId}]   ⚠️ Skipping ${pendingSiteName} - invalid site name`);
+                    }
+                  } else {
+                    console.log(`[${operationId}]   ❌ No match: ${pendingSiteName} (price: ${pendingPrice} !== ${subscriptionPriceId})`);
+                  }
+                });
+              }
+              console.log(`[${operationId}] ✅ Found ${pendingSitesToRemove.length} pending site(s) matching by price:`, pendingSitesToRemove);
               
+              // Combine all added sites (from subscription items, user.sites, and matching pending sites)
+              const allAddedSites = [...new Set([...addedSites, ...sitesInUserRecord, ...pendingSitesToRemove])];
+              console.log(`[${operationId}] ✅ STEP 2.3: Combined ${allAddedSites.length} unique site(s) to remove:`, allAddedSites);
+              
+              // STEP 2: Delete pending sites from database FIRST (before filtering user.pendingSites)
+              // This ensures we delete ALL added sites, even if they're removed from user.pendingSites during filtering
+              if (env.DB) {
+                console.log(`[${operationId}] 🔍 STEP 2.4: Starting database deletion process...`);
+                // If we have pending sites to remove by price match, delete them directly
+                if (pendingSitesToRemove.length > 0) {
+                  console.log(`[${operationId}] 🗑️ STEP 2.4.1: Removing ${pendingSitesToRemove.length} pending site(s) by price match:`, pendingSitesToRemove);
+                  let deletedByPrice = 0;
+                  for (const siteToRemove of pendingSitesToRemove) {
+                    try {
+                      console.log(`[${operationId}]   - Attempting to delete: ${siteToRemove} (email: ${email})`);
+                      const deleteResult = await env.DB.prepare(
+                        'DELETE FROM pending_sites WHERE user_email = ? AND LOWER(TRIM(site_domain)) = ?'
+                      ).bind(email, siteToRemove).run();
+                      if (deleteResult.success) {
+                        console.log(`[${operationId}]   ✅ Deleted pending site from database (price match): ${siteToRemove}`);
+                        deletedByPrice++;
+                      } else {
+                        console.warn(`[${operationId}]   ⚠️ Delete query succeeded but no rows affected for: ${siteToRemove}`);
+                      }
+                    } catch (dbError) {
+                      console.error(`[${operationId}]   ❌ Failed to remove pending site ${siteToRemove} from database:`, dbError);
+                    }
+                  }
+                  console.log(`[${operationId}] ✅ Deleted ${deletedByPrice}/${pendingSitesToRemove.length} pending site(s) by price match`);
+                } else {
+                  console.log(`[${operationId}] ℹ️ No pending sites to remove by price match`);
+                }
+                
+                // Also delete by site name match if we have added sites
+                if (allAddedSites.length > 0) {
+                  console.log(`[${operationId}] 🗑️ STEP 2.4.2: Removing ${allAddedSites.length} pending site(s) from database (name match):`, allAddedSites);
+                  let deletedByName = 0;
+                  for (const addedSite of allAddedSites) {
+                    // Skip if already deleted above
+                    if (pendingSitesToRemove.includes(addedSite)) {
+                      console.log(`[${operationId}]   ⏭️ Skipping ${addedSite} - already deleted by price match`);
+                      continue;
+                    }
+                    
+                    try {
+                      console.log(`[${operationId}]   - Attempting to delete: ${addedSite} (email: ${email})`);
+                      const deleteResult = await env.DB.prepare(
+                        'DELETE FROM pending_sites WHERE user_email = ? AND LOWER(TRIM(site_domain)) = ?'
+                      ).bind(email, addedSite).run();
+                      if (deleteResult.success) {
+                        console.log(`[${operationId}]   ✅ Deleted pending site from database (name match): ${addedSite}`);
+                        deletedByName++;
+                      } else {
+                        console.warn(`[${operationId}]   ⚠️ Delete query succeeded but no rows affected for: ${addedSite}`);
+                      }
+                    } catch (dbError) {
+                      console.error(`[${operationId}]   ❌ Failed to remove pending site ${addedSite} from database:`, dbError);
+                    }
+                  }
+                  console.log(`[${operationId}] ✅ Deleted ${deletedByName}/${allAddedSites.length} pending site(s) by name match`);
+                } else {
+                  console.log(`[${operationId}] ℹ️ No pending sites to remove by name match`);
+                }
+                
+                // FALLBACK: If subscription was just created and we have pending sites with matching price,
+                // remove ALL pending sites with that price (in case site name matching failed)
+                // CRITICAL: This should run even if we found some matches, to catch any missed ones
+                if (sub.items && sub.items.data && sub.items.data.length > 0 && user.pendingSites && user.pendingSites.length > 0) {
+                  const subscriptionPriceId = sub.items.data[0].price.id;
+                  const matchingPendingSites = user.pendingSites.filter(ps => {
+                    const psPrice = ps.price || ps.price_id;
+                    return psPrice === subscriptionPriceId;
+                  });
+                  
+                  // Remove ALL matching pending sites by price, regardless of whether name matching worked
+                  // This ensures we catch all pending sites that were just purchased
+                  if (matchingPendingSites.length > 0) {
+                    console.log(`[${operationId}] 🗑️ STEP 2.4.3: FALLBACK - Removing ${matchingPendingSites.length} pending site(s) by price match:`, matchingPendingSites.map(ps => ({ site: ps.site || ps.site_domain, price: ps.price || ps.price_id })));
+                    let deletedByFallback = 0;
+                    for (const pendingSite of matchingPendingSites) {
+                      const siteToRemove = (pendingSite.site || pendingSite.site_domain || '').toLowerCase().trim();
+                      if (siteToRemove && !siteToRemove.startsWith('site_')) {
+                        // Skip if already in allAddedSites (was already removed)
+                        if (allAddedSites.includes(siteToRemove)) {
+                          console.log(`[${operationId}]   ⏭️ Skipping ${siteToRemove} - already removed by name/price match`);
+                          continue;
+                        }
+                        
+                        try {
+                          console.log(`[${operationId}]   - Attempting to delete (fallback): ${siteToRemove} (email: ${email})`);
+                          const deleteResult = await env.DB.prepare(
+                            'DELETE FROM pending_sites WHERE user_email = ? AND LOWER(TRIM(site_domain)) = ?'
+                          ).bind(email, siteToRemove).run();
+                          if (deleteResult.success) {
+                            console.log(`[${operationId}]   ✅ Deleted pending site from database (fallback price match): ${siteToRemove}`);
+                            deletedByFallback++;
+                            // Add to allAddedSites so it gets removed from user object too
+                            if (!allAddedSites.includes(siteToRemove)) {
+                              allAddedSites.push(siteToRemove);
+                            }
+                          } else {
+                            console.warn(`[${operationId}]   ⚠️ Delete query succeeded but no rows affected for: ${siteToRemove}`);
+                          }
+                        } catch (dbError) {
+                          console.error(`[${operationId}]   ❌ Failed to remove pending site ${siteToRemove} from database:`, dbError);
+                        }
+                      } else {
+                        console.log(`[${operationId}]   ⚠️ Skipping invalid site name: ${siteToRemove}`);
+                      }
+                    }
+                    console.log(`[${operationId}] ✅ Deleted ${deletedByFallback}/${matchingPendingSites.length} pending site(s) by fallback price match`);
+                  } else {
+                    console.log(`[${operationId}] ℹ️ No pending sites found matching subscription price for fallback removal`);
+                }
+              } else {
+                console.log(`[${operationId}] ⚠️ Database not available - cannot remove pending sites`);
+              }
+              }
+              
+              // STEP 3: Now filter user.pendingSites to remove added sites
+              console.log(`[${operationId}] 🔍 STEP 3: Filtering user.pendingSites array...`);
               const beforeCount = user.pendingSites.length;
+              console.log(`[${operationId}]   - Before filtering: ${beforeCount} pending site(s)`);
+              console.log(`[${operationId}]   - Sites to remove from array: ${allAddedSites.length} site(s):`, allAddedSites);
               
               // Remove pending sites that match any added site (case-insensitive, trimmed)
               // Also remove if the site is now in user.sites (was successfully added)
               user.pendingSites = user.pendingSites.filter(pending => {
-                const pendingSiteLower = pending.site.toLowerCase().trim();
-                const isAdded = addedSites.some(added => added.toLowerCase().trim() === pendingSiteLower) ||
-                                sitesInUserRecord.some(site => site.toLowerCase().trim() === pendingSiteLower);
+                const pendingSiteLower = (pending.site || pending.site_domain || pending).toLowerCase().trim();
+                const isAdded = allAddedSites.includes(pendingSiteLower);
                 if (isAdded) {
+                  console.log(`[${operationId}]   🗑️ Removing pending site from user object: ${pendingSiteLower}`);
                 }
                 return !isAdded;
               });
               
               const afterCount = user.pendingSites.length;
+              const removedCount = beforeCount - afterCount;
+              console.log(`[${operationId}] ✅ Pending sites array: ${beforeCount} → ${afterCount} (removed ${removedCount})`);
+              
               if (afterCount > 0) {
                 // If we added sites but pending sites remain, they might be from a different source
                 // Remove any pending sites that are now in user.sites (double-check)
                 const stillPending = user.pendingSites.filter(pending => {
-                  const pendingSiteLower = pending.site.toLowerCase().trim();
-                  const isNowActive = sitesInUserRecord.some(site => site.toLowerCase().trim() === pendingSiteLower);
+                  const pendingSiteLower = (pending.site || pending.site_domain || pending).toLowerCase().trim();
+                  const isNowActive = sitesInUserRecord.includes(pendingSiteLower);
                   if (isNowActive) {
+                    console.log(`[${operationId}] 🗑️ Removing pending site (double-check): ${pendingSiteLower}`);
                   }
                   return !isNowActive;
                 });
                 user.pendingSites = stillPending;
               }
-            } else {
-            }
-            
-            // Remove pending sites from database
-            if (env.DB && user.pendingSites && user.pendingSites.length > 0) {
-              const sitesToRemove = user.pendingSites.filter(pending => {
-                const pendingSiteLower = (pending.site || pending).toLowerCase().trim();
-                const addedSites = sub.items.data.map((item, index) => {
-                  const siteFromMeta = sitesFromMetadata[index] || `site_${index + 1}`;
-                  return siteFromMeta.toLowerCase().trim();
-                });
-                return addedSites.includes(pendingSiteLower);
-              });
               
-              for (const pending of sitesToRemove) {
-                const siteToRemove = (pending.site || pending).toLowerCase().trim();
+              // CRITICAL: Save user object immediately after removing pending sites
+              // This ensures pending sites are removed from the database even if payment save fails
+              console.log(`[${operationId}] 🔍 STEP 4: Saving user object with updated pending sites...`);
+              if (beforeCount !== afterCount || allAddedSites.length > 0) {
                 try {
-                  await env.DB.prepare(
-                    'DELETE FROM pending_sites WHERE user_email = ? AND LOWER(TRIM(site_domain)) = ?'
-                  ).bind(email, siteToRemove).run();
-                } catch (dbError) {
-                  console.error(`[${operationId}] Failed to remove pending site from database:`, dbError);
+                  console.log(`[${operationId}]   - Remaining pending sites: ${afterCount}`);
+                  console.log(`[${operationId}]   - Sites removed: ${removedCount}`);
+                  console.log(`[${operationId}]   - Attempting to save user object...`);
+                  await saveUserByEmail(env, email, user);
+                  console.log(`[${operationId}] ✅ User object saved successfully with updated pending sites`);
+                } catch (saveError) {
+                  console.error(`[${operationId}] ❌ Failed to save user object after removing pending sites:`, saveError);
+                  console.error(`[${operationId}] ❌ Error details:`, saveError.message);
+                  console.error(`[${operationId}] ❌ Error stack:`, saveError.stack);
+                  // Don't throw - continue with payment save
                 }
+              } else {
+                console.log(`[${operationId}] ℹ️ No changes to pending sites - skipping save`);
               }
             }
             
-            // User record will be saved AFTER payment is saved (see below)
+            // User record will be saved again AFTER payment is saved (see below) to ensure all data is synced
           }
 
           // Save payment details to database
@@ -3749,9 +4593,16 @@ export default {
           // If any operation fails, queue it for retry but always return 'ok' to Stripe
           // Note: failedOperations is already initialized at function scope above
           
+          console.log(`[${operationId}] 💰 STEP 5: Starting payment processing and database updates...`);
+          console.log(`[${operationId}]   - Customer ID: ${customerId}`);
+          console.log(`[${operationId}]   - Subscription ID: ${subscriptionId}`);
+          console.log(`[${operationId}]   - Email: ${email}`);
+          console.log(`[${operationId}]   - Purchase Type: ${purchaseType}`);
+          
           try {
             // Get all sites from subscription metadata (site_0, site_1, etc.)
             // Create payment records for ALL sites, not just the first one
+            console.log(`[${operationId}] 🔍 STEP 5.1: Extracting site names for payment records...`);
             const allSites = [];
             
             // Extract all sites from metadata
@@ -3760,16 +4611,19 @@ export default {
                 const site = subscriptionMetadata[key];
                 if (site && site !== 'unknown' && !site.startsWith('site_')) {
                   allSites.push(site);
+                  console.log(`[${operationId}]   - Found site in subscription metadata (${key}): ${site}`);
                 }
               }
             });
             
             // If no sites in metadata, try to get from subscription items
             if (allSites.length === 0 && sub.items && sub.items.data && sub.items.data.length > 0) {
-              sub.items.data.forEach(item => {
+              console.log(`[${operationId}]   - No sites in metadata, checking subscription items...`);
+              sub.items.data.forEach((item, idx) => {
                 const site = item.metadata?.site;
                 if (site && site !== 'unknown' && !site.startsWith('site_')) {
                   allSites.push(site);
+                  console.log(`[${operationId}]   - Found site in item ${idx} metadata: ${site}`);
                 }
               });
             }
@@ -3777,32 +4631,38 @@ export default {
             // If still no sites, use custom field (for initial subscriptions)
             if (allSites.length === 0 && customFieldSiteUrl) {
               allSites.push(customFieldSiteUrl);
+              console.log(`[${operationId}]   - Using custom field site URL: ${customFieldSiteUrl}`);
             }
             
             // Legacy: Check custom fields (for backward compatibility with old payment links)
             if (allSites.length === 0 && session.custom_fields && session.custom_fields.length > 0) {
+              console.log(`[${operationId}]   - Checking custom fields...`);
               const siteUrlField = session.custom_fields.find(field => 
                 field.key === 'enteryourlivesiteurl' || 
                 field.key === 'enteryourlivesiteur' ||
                 field.key === 'enteryourlivedomain' ||
                 field.key === 'enteryourlivedomaine' ||
-                field.key?.toLowerCase().includes('domain') ||
+                field.key?.toLowerCase().includes('domain') || 
                 field.key?.toLowerCase().includes('site') ||
                 (field.type === 'text' && field.text && field.text.value)
               );
               if (siteUrlField && siteUrlField.text && siteUrlField.text.value) {
                 allSites.push(siteUrlField.text.value.trim());
+                console.log(`[${operationId}]   - Found site in custom field: ${siteUrlField.text.value.trim()}`);
               }
             }
             
+            console.log(`[${operationId}] ✅ Extracted ${allSites.length} site(s) for payment records:`, allSites);
 
             // Get amount from session or subscription
             // CRITICAL: Declare these at function scope so they're accessible in error handlers
             let totalAmount = session.amount_total || 0;
             let currency = session.currency || 'usd';
+            console.log(`[${operationId}] 💰 Payment details: amount=${totalAmount}, currency=${currency}`);
 
             // Calculate amount per site (divide total by number of sites, or get from price if available)
             const amountPerSite = allSites.length > 0 ? Math.floor(totalAmount / allSites.length) : totalAmount;
+            console.log(`[${operationId}] 💰 Amount per site: ${amountPerSite} (${allSites.length} sites)`);
 
             // Magic link generation is DISABLED - Memberstack handles authentication via passwordless login
             // No custom magic links needed
@@ -3812,14 +4672,17 @@ export default {
             // Create payment records for ALL sites, not just the first one
             // For quantity purchases (license_addon), save payment record even without sites
             if (env.DB && (allSites.length > 0 || purchaseType === 'quantity')) {
+              console.log(`[${operationId}] 🔍 STEP 5.2: Saving payment records to database...`);
               let paymentSaved = false;
             for (let attempt = 0; attempt < 3; attempt++) {
               try {
+                  console.log(`[${operationId}]   - Payment save attempt ${attempt + 1}/3...`);
                   const timestamp = Math.floor(Date.now() / 1000);
                   
                   // For quantity purchases, save one payment record without site
                   if (purchaseType === 'quantity' && allSites.length === 0) {
-                    await env.DB.prepare(
+                    console.log(`[${operationId}]   - Creating payment record for quantity purchase (no site)...`);
+                    const paymentResult = await env.DB.prepare(
                       `INSERT INTO payments (
                         customer_id, subscription_id, email, amount, currency, 
                         status, site_domain, magic_link, magic_link_generated, 
@@ -3838,54 +4701,73 @@ export default {
                       timestamp,
                       timestamp
                     ).run();
+                    console.log(`[${operationId}]   ✅ Payment record created for quantity purchase:`, paymentResult.success ? 'SUCCESS' : 'FAILED');
                 } else {
                     // Create payment record for each site
+                    console.log(`[${operationId}]   - Creating payment records for ${allSites.length} site(s)...`);
+                    let paymentCount = 0;
                     for (const siteDomain of allSites) {
-                    // Try to get the actual price for this site from subscription items
-                    let siteAmount = amountPerSite;
-                    if (sub.items && sub.items.data) {
-                      const item = sub.items.data.find(i => 
-                        (i.metadata?.site || '').toLowerCase().trim() === siteDomain.toLowerCase().trim()
-                      );
-                      if (item && item.price) {
-                        // Get price details to get the actual amount
-                        try {
-                          const priceRes = await stripeFetch(env, `/prices/${item.price.id}`);
-                          if (priceRes.status === 200) {
-                            siteAmount = priceRes.body.unit_amount || amountPerSite;
+                      console.log(`[${operationId}]     - Processing payment for site: ${siteDomain}`);
+                      // Try to get the actual price for this site from subscription items
+                      let siteAmount = amountPerSite;
+                      if (sub.items && sub.items.data) {
+                        const item = sub.items.data.find(i => 
+                          (i.metadata?.site || '').toLowerCase().trim() === siteDomain.toLowerCase().trim()
+                        );
+                        if (item && item.price) {
+                          console.log(`[${operationId}]       - Found item with price ID: ${item.price.id}`);
+                          // Get price details to get the actual amount
+                          try {
+                            const priceRes = await stripeFetch(env, `/prices/${item.price.id}`);
+                            if (priceRes.status === 200) {
+                              siteAmount = priceRes.body.unit_amount || amountPerSite;
+                              console.log(`[${operationId}]       - Price amount from Stripe: ${siteAmount}`);
+                            }
+                          } catch (priceError) {
+                            console.warn(`[${operationId}]       ⚠️ Failed to fetch price details, using calculated amount: ${priceError.message}`);
                           }
-                        } catch (priceError) {
                         }
                       }
+                      
+                      console.log(`[${operationId}]       - Inserting payment record: site=${siteDomain}, amount=${siteAmount}, currency=${currency}`);
+                      const paymentResult = await env.DB.prepare(
+                        `INSERT INTO payments (
+                          customer_id, subscription_id, email, amount, currency, 
+                          status, site_domain, magic_link, magic_link_generated, 
+                          created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                      ).bind(
+                        customerId,
+                        subscriptionId,
+                        email,
+                          siteAmount,
+                        currency,
+                        'succeeded',
+                        siteDomain,
+                          null, // magic_link - not used
+                          0, // magic_link_generated - false
+                        timestamp,
+                        timestamp
+                      ).run();
+                      
+                      if (paymentResult.success) {
+                        paymentCount++;
+                        console.log(`[${operationId}]       ✅ Payment record created successfully for ${siteDomain}`);
+                      } else {
+                        console.error(`[${operationId}]       ❌ Payment record creation failed for ${siteDomain}`);
+                      }
                     }
-                    
-                  await env.DB.prepare(
-                    `INSERT INTO payments (
-                      customer_id, subscription_id, email, amount, currency, 
-                      status, site_domain, magic_link, magic_link_generated, 
-                      created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                  ).bind(
-                    customerId,
-                    subscriptionId,
-                    email,
-                      siteAmount,
-                    currency,
-                    'succeeded',
-                    siteDomain,
-                      null, // magic_link - not used
-                      0, // magic_link_generated - false
-                    timestamp,
-                    timestamp
-                  ).run();
-                    }
+                    console.log(`[${operationId}]   ✅ Created ${paymentCount}/${allSites.length} payment record(s)`);
                   }
 
                   paymentSaved = true;
+                  console.log(`[${operationId}] ✅ Payment records saved successfully on attempt ${attempt + 1}`);
                   break;
                 } catch (dbError) {
-                  console.error(`[${operationId}] ❌ Database save attempt ${attempt + 1} failed:`, dbError.message);
+                  console.error(`[${operationId}] ❌ Payment save attempt ${attempt + 1}/3 failed:`, dbError.message);
+                  console.error(`[${operationId}] ❌ Error details:`, dbError);
                   if (attempt === 2) {
+                    console.error(`[${operationId}] ❌ CRITICAL: Failed to save payment records after 3 attempts`);
                     console.error(`[${operationId}] ❌ Failed to save payment to D1 after 3 attempts:`, dbError);
                     failedOperations.push({ 
                       type: 'save_payment', 
@@ -3913,6 +4795,26 @@ export default {
                   timestamp: Date.now(),
                   retryCount: 0
                 });
+              } else {
+                // Save to KV storage (for direct link purchase - Use Case 1)
+                // Only save for site purchases, not quantity purchases
+                if (purchaseType !== 'quantity' && allSites.length > 0) {
+                  // Get site name - prioritize custom field, then first site from metadata
+                  const siteName = customFieldSiteUrl || allSites[0] || (sub.items?.data?.[0]?.metadata?.site);
+                  if (siteName) {
+                    console.log(`[${operationId}] 💾 Saving to KV storage for site: ${siteName}`);
+                    await saveSubscriptionToKV(
+                      env,
+                      customerId,
+                      subscriptionId,
+                      email,
+                      siteName,
+                      sub.status === 'active' ? 'complete' : sub.status,
+                      'paid',
+                      sub.cancel_at_period_end || false
+                    );
+                  }
+                }
               }
             } else {
               console.error(`[${operationId}] ❌ CRITICAL: env.DB is NOT configured! Payment will NOT be saved to database.`);
@@ -4017,6 +4919,52 @@ export default {
               }
             }
             
+            // CRITICAL: Remove pending sites from database AFTER payment is saved
+            // This ensures pending sites are removed even if they weren't matched by name earlier
+            let subscriptionPriceIds = [];
+            if (env.DB && sub.items && sub.items.data && sub.items.data.length > 0) {
+              try {
+                // Get price_id from subscription items
+                subscriptionPriceIds = sub.items.data.map(item => item.price.id);
+                console.log(`[${operationId}] 🗑️ Removing pending sites by price_id match:`, subscriptionPriceIds);
+                
+                // Remove ALL pending sites that match any of the subscription's price_ids
+                // This is more reliable than matching by site name
+                for (const priceId of subscriptionPriceIds) {
+                  try {
+                    const deleteResult = await env.DB.prepare(
+                      'DELETE FROM pending_sites WHERE user_email = ? AND price_id = ?'
+                    ).bind(email.toLowerCase().trim(), priceId).run();
+                    
+                    if (deleteResult.success) {
+                      console.log(`[${operationId}] ✅ Removed pending sites with price_id ${priceId} from database`);
+                    }
+                  } catch (deleteError) {
+                    console.error(`[${operationId}] ❌ Error removing pending sites by price_id ${priceId}:`, deleteError);
+                  }
+                }
+                
+                // Also remove by site name match (for sites that were successfully added)
+                if (allSites && allSites.length > 0) {
+                  for (const site of allSites) {
+                    try {
+                      const deleteResult = await env.DB.prepare(
+                        'DELETE FROM pending_sites WHERE user_email = ? AND LOWER(TRIM(site_domain)) = ?'
+                      ).bind(email.toLowerCase().trim(), site.toLowerCase().trim()).run();
+                      
+                      if (deleteResult.success) {
+                        console.log(`[${operationId}] ✅ Removed pending site ${site} from database`);
+                      }
+                    } catch (deleteError) {
+                      console.error(`[${operationId}] ❌ Error removing pending site ${site}:`, deleteError);
+                    }
+                  }
+                }
+              } catch (pendingSitesError) {
+                console.error(`[${operationId}] ❌ Error removing pending sites:`, pendingSitesError);
+              }
+            }
+            
             let userSitesSaved = false;
             for (let attempt = 0; attempt < 3; attempt++) {
               try {
@@ -4070,11 +5018,60 @@ export default {
                     }
                   }
                   
+                  // CRITICAL: Remove pending sites from user object after they've been removed from database
+                  if (completeUser.pendingSites && completeUser.pendingSites.length > 0) {
+                    const beforeCount = completeUser.pendingSites.length;
+                    // Remove pending sites that match the subscription's price_ids
+                    completeUser.pendingSites = completeUser.pendingSites.filter(pending => {
+                      const pendingPrice = pending.price || pending.price_id;
+                      return !subscriptionPriceIds.includes(pendingPrice);
+                    });
+                    const afterCount = completeUser.pendingSites.length;
+                    if (beforeCount !== afterCount) {
+                      console.log(`[${operationId}] 🗑️ Removed ${beforeCount - afterCount} pending site(s) from user object`);
+                    }
+                  }
+                  
                   // Save the complete merged user structure
                   await saveUserByEmail(env, email, completeUser);
+                  console.log(`[${operationId}] ✅ Saved user record with subscription details`);
+                  
+                  // CRITICAL: Verify subscription details were saved by checking database
+                  if (env.DB) {
+                    try {
+                      const verifySub = await env.DB.prepare(
+                        'SELECT subscription_id FROM subscriptions WHERE subscription_id = ? AND user_email = ?'
+                      ).bind(subscriptionId, email.toLowerCase().trim()).first();
+                      
+                      if (!verifySub) {
+                        console.warn(`[${operationId}] ⚠️ Subscription ${subscriptionId} not found in database after save - retrying...`);
+                        // Retry saving subscription details directly to database
+                        const timestamp = Math.floor(Date.now() / 1000);
+                        await env.DB.prepare(
+                          'INSERT OR REPLACE INTO subscriptions (subscription_id, customer_id, user_email, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+                        ).bind(subscriptionId, customerId, email.toLowerCase().trim(), 'active', timestamp, timestamp).run();
+                        
+                        // Also save subscription items
+                        if (sub.items && sub.items.data && sub.items.data.length > 0) {
+                          for (const item of sub.items.data) {
+                            const site = item.metadata?.site || allSites[0] || null;
+                            await env.DB.prepare(
+                              'INSERT OR REPLACE INTO subscription_items (subscription_id, item_id, site_domain, price_id, quantity, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+                            ).bind(subscriptionId, item.id, site, item.price.id, item.quantity || 1, 'active', timestamp).run();
+                          }
+                        }
+                        console.log(`[${operationId}] ✅ Retried and saved subscription details directly to database`);
+                      } else {
+                        console.log(`[${operationId}] ✅ Verified subscription details saved to database`);
+                      }
+                    } catch (verifyError) {
+                      console.error(`[${operationId}] ❌ Error verifying subscription details:`, verifyError);
+                    }
+                  }
                 } else {
                   // Fallback: if we can't load from database, save userToSave
                   await saveUserByEmail(env, email, userToSave);
+                  console.log(`[${operationId}] ✅ Saved user record (fallback)`);
                 }
                 userSitesSaved = true;
                 break;
@@ -4244,12 +5241,16 @@ export default {
                               continue;
                             }
                             
+                            // Extract billing_period and renewal_date from Stripe subscription
+                            const billingPeriod = extractBillingPeriodFromStripe(sub);
+                            const renewalDate = sub.current_period_end || null;
+                            
                             // Insert new license key with subscription details
                             await env.DB.prepare(
                               `INSERT INTO licenses 
                                (license_key, customer_id, subscription_id, item_id, 
-                                site_domain, used_site_domain, status, purchase_type, created_at, updated_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                                site_domain, used_site_domain, status, purchase_type, billing_period, renewal_date, created_at, updated_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
                             ).bind(
                               licenseKey,
                               customerId,
@@ -4259,6 +5260,8 @@ export default {
                               null,  // Will be set when activated
                               'active',  // Status: active after payment
                               'quantity',
+                              billingPeriod,
+                              renewalDate,
                               timestamp,
                               timestamp
                             ).run();
@@ -4294,20 +5297,22 @@ export default {
                   // If still no keys found, generate them (fallback for old flow)
                   if (preGeneratedLicenseKeys.length === 0) {
                     const itemQuantity = sub.items.data[0]?.quantity || quantity || sub.items.data.length || 1;
-                    preGeneratedLicenseKeys = generateLicenseKeys(itemQuantity);
+                    preGeneratedLicenseKeys = await generateLicenseKeys(itemQuantity, env);
                   }
                   
                   // Map each license key to its subscription item
                   // Each subscription item should have a license key in its metadata (from /purchase-quantity endpoint)
-                  sub.items.data.forEach((item, index) => {
+                  // Use for...of loop to support async operations
+                  for (let index = 0; index < sub.items.data.length; index++) {
+                    const item = sub.items.data[index];
                     // Get license key from item metadata (PRIMARY - set by /purchase-quantity endpoint)
                     let licenseKey = item.metadata?.license_key;
                     // Fallback to pre-generated array
                     if (!licenseKey && preGeneratedLicenseKeys[index]) {
                       licenseKey = preGeneratedLicenseKeys[index];
                     } else if (!licenseKey) {
-                      // Last resort: generate new key if not found
-                      licenseKey = generateLicenseKey();
+                      // Last resort: generate new unique key if not found
+                      licenseKey = await generateUniqueLicenseKey(env);
                     }
                     
                     // Check if license already exists
@@ -4319,7 +5324,7 @@ export default {
                         license_key: licenseKey // Pre-generated key
                       });
                     }
-                  });
+                  }
                 }
                 
                 // CRITICAL: Ensure purchase_type metadata is set on all items
@@ -4382,7 +5387,16 @@ export default {
               
               if (licensesToCreate.length > 0) {
                 // Use pre-generated license keys if available, otherwise generate new ones
-                const licenseKeys = licensesToCreate.map(l => l.license_key || generateLicenseKey());
+                // Generate unique license keys for licenses that don't have one yet
+                const licenseKeys = [];
+                for (const l of licensesToCreate) {
+                  if (l.license_key) {
+                    licenseKeys.push(l.license_key);
+                  } else {
+                    const uniqueKey = await generateUniqueLicenseKey(env);
+                    licenseKeys.push(uniqueKey);
+                  }
+                }
                 
                 // ========================================
                 // USE CASE 1 DEBUG: Save Licenses to Database
@@ -4405,10 +5419,27 @@ export default {
                         // For site-based purchases, automatically assign used_site_domain = site_domain
                         // For quantity-based purchases, used_site_domain remains NULL until activated
                         const usedSiteDomain = (purchaseType === 'site' && site) ? site : null;
+                        // Extract billing_period and renewal_date from Stripe subscription (if available)
+                        const billingPeriod = sub ? extractBillingPeriodFromStripe(sub) : null;
+                        const renewalDate = sub ? (sub.current_period_end || null) : null;
+                        
                         // Use license_key as primary key, include purchase_type and used_site_domain
-                        return env.DB.prepare(
-                          'INSERT INTO licenses (license_key, customer_id, subscription_id, item_id, site_domain, used_site_domain, status, purchase_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-                        ).bind(key, customerId, subscriptionId, itemId, site, usedSiteDomain, 'active', purchaseType, timestamp, timestamp);
+                        // Try with billing_period and renewal_date first (if columns exist)
+                        try {
+                          return env.DB.prepare(
+                            'INSERT INTO licenses (license_key, customer_id, subscription_id, item_id, site_domain, used_site_domain, status, purchase_type, billing_period, renewal_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                          ).bind(key, customerId, subscriptionId, itemId, site, usedSiteDomain, 'active', purchaseType, billingPeriod, renewalDate, timestamp, timestamp);
+                        } catch (colErr) {
+                          // If columns don't exist, fallback to insert without them
+                          if (colErr.message && (colErr.message.includes('no such column: billing_period') || 
+                                                 colErr.message.includes('no such column: renewal_date'))) {
+                            return env.DB.prepare(
+                              'INSERT INTO licenses (license_key, customer_id, subscription_id, item_id, site_domain, used_site_domain, status, purchase_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                            ).bind(key, customerId, subscriptionId, itemId, site, usedSiteDomain, 'active', purchaseType, timestamp, timestamp);
+                          } else {
+                            throw colErr;
+                          }
+                        }
                       });
                       const batch = env.DB.batch(inserts);
                       await batch;
@@ -4547,7 +5578,7 @@ export default {
                 
                 try {
 
-                  const existingMember = await getMemberstackMember(email, env);
+                  const existingMember = await this.getMemberstackMember(email, env);
                   if (existingMember) {
                     const existingEmail = existingMember.email || existingMember._email || 'N/A';
                     const existingId = existingMember.id || existingMember._id;
@@ -4575,7 +5606,7 @@ export default {
                 // If member doesn't exist, create it
                 if (!member) {
 
-                  member = await createMemberstackMember(email, env);
+                  member = await this.createMemberstackMember(email, env);
                   memberWasCreated = true;
                   const newMemberId = member.id || member._id;
                   const newMemberEmail = member.email || member._email || email;
@@ -4782,7 +5813,18 @@ export default {
           const subscription = event.data.object;
           const subscriptionId = subscription.id;
           const customerId = subscription.customer;
-
+          
+          // Log subscription update with detailed status information
+          await logStripeEvent(env, event, subscriptionId, customerId, {
+            action: 'subscription_updated',
+            status: subscription.status,
+            cancel_at_period_end: subscription.cancel_at_period_end,
+            canceled_at: subscription.canceled_at,
+            current_period_end: subscription.current_period_end,
+            current_period_start: subscription.current_period_start,
+            billing_cycle_anchor: subscription.billing_cycle_anchor,
+            note: 'Subscription status updated by Stripe'
+          });
 
           // Get user email from customerId
           const userEmail = await getCustomerEmail(env, customerId);
@@ -4812,20 +5854,37 @@ export default {
             const sub = subRes.body;
             
             // CRITICAL: Check if subscription is cancelled - skip license generation and site updates
+            const now = Math.floor(Date.now() / 1000);
+            const periodEnded = sub.current_period_end && sub.current_period_end < now;
             const isCancelled = sub.status === 'canceled' || 
-                               sub.cancel_at_period_end === true ||
+                               (sub.cancel_at_period_end === true && periodEnded) ||
                                sub.canceled_at !== null;
             
-            if (isCancelled) {
+            // Always update subscription status in database when cancel_at_period_end is true
+            if (isCancelled || sub.cancel_at_period_end === true) {
               // Still update subscription status in database, but don't generate licenses or update sites
               // The subscription is cancelled, so we should mark items as inactive
               if (env.DB) {
                 try {
                   const timestamp = Math.floor(Date.now() / 1000);
+                  // Determine final status: if period ended and cancel_at_period_end was true, it's now cancelled
+                  // When Stripe automatically cancels at period end, it sends status: 'canceled'
+                  let finalStatus = sub.status || 'active';
+                  if (sub.status === 'canceled') {
+                    // Stripe has cancelled the subscription (either manually or automatically at period end)
+                    finalStatus = 'canceled';
+                  } else if (sub.cancel_at_period_end === true && periodEnded) {
+                    // Period ended and cancel_at_period_end was true - subscription should be cancelled
+                    finalStatus = 'canceled';
+                  } else if (sub.cancel_at_period_end === true && !periodEnded) {
+                    // Still active but will cancel at period end
+                    finalStatus = 'active';
+                  }
+                  
                   await env.DB.prepare(
                     'UPDATE subscriptions SET status = ?, cancel_at_period_end = ?, cancel_at = ?, current_period_end = ?, updated_at = ? WHERE subscription_id = ?'
                   ).bind(
-                    sub.status || 'canceled',
+                    finalStatus,
                     sub.cancel_at_period_end ? 1 : 0,
                     sub.canceled_at || null, // Stripe returns canceled_at, we store it as cancel_at
                     sub.current_period_end || null, // Ensure current_period_end is updated from Stripe
@@ -4833,15 +5892,48 @@ export default {
                     subscriptionId
                   ).run();
                   
-                  // Mark all subscription items as inactive
-                  await env.DB.prepare(
-                    'UPDATE subscription_items SET status = ?, updated_at = ? WHERE subscription_id = ? AND status = ?'
-                  ).bind('inactive', timestamp, subscriptionId, 'active').run();
+                  // Mark items and licenses as inactive if:
+                  // 1. Subscription status is 'canceled' (Stripe has cancelled it)
+                  // 2. OR period has ended and cancel_at_period_end was true
+                  // This handles both manual cancellations and automatic cancellations at period end
+                  const shouldMarkInactive = sub.status === 'canceled' || 
+                                             (periodEnded && sub.cancel_at_period_end === true);
                   
-                  // Mark all licenses as inactive for this subscription
-                  await env.DB.prepare(
-                    'UPDATE licenses SET status = ?, updated_at = ? WHERE subscription_id = ? AND status = ?'
-                  ).bind('inactive', timestamp, subscriptionId, 'active').run();
+                  if (shouldMarkInactive) {
+                    console.log(`[subscription.updated] Marking subscription ${subscriptionId} as inactive - status: ${sub.status}, periodEnded: ${periodEnded}, cancel_at_period_end: ${sub.cancel_at_period_end}`);
+                    
+                    // Mark all subscription items as inactive
+                    await env.DB.prepare(
+                      'UPDATE subscription_items SET status = ?, updated_at = ? WHERE subscription_id = ? AND status = ?'
+                    ).bind('inactive', timestamp, subscriptionId, 'active').run();
+                    
+                    // Mark all licenses as inactive for this subscription
+                    const licenseUpdateResult = await env.DB.prepare(
+                      'UPDATE licenses SET status = ?, updated_at = ? WHERE subscription_id = ? AND status = ?'
+                    ).bind('inactive', timestamp, subscriptionId, 'active').run();
+                    
+                    if (licenseUpdateResult.success) {
+                      console.log(`[subscription.updated] ✅ Marked licenses as inactive for subscription ${subscriptionId}`);
+                      
+                      // Log the license deactivation
+                      await logStripeEvent(env, {
+                        id: `manual_${timestamp}`,
+                        type: 'subscription.cancelled',
+                        data: { object: sub },
+                        created: timestamp
+                      }, subscriptionId, customerId, {
+                        action: 'licenses_marked_inactive',
+                        period_ended: periodEnded,
+                        cancel_at_period_end: sub.cancel_at_period_end,
+                        status: sub.status,
+                        note: 'Licenses marked inactive due to subscription cancellation'
+                      });
+                    } else {
+                      console.warn(`[subscription.updated] ⚠️ Failed to mark licenses as inactive for subscription ${subscriptionId}`);
+                    }
+                  } else {
+                    console.log(`[subscription.updated] Subscription ${subscriptionId} is not yet cancelled - status: ${sub.status}, periodEnded: ${periodEnded}, cancel_at_period_end: ${sub.cancel_at_period_end}`);
+                  }
                 } catch (dbErr) {
                   console.error('Error updating cancelled subscription in database:', dbErr);
                 }
@@ -4895,11 +5987,14 @@ export default {
                     
                     if (!existingLicense) {
                       // Generate new license key only if subscription is active
-                      const licenseKey = generateLicenseKey();
+                      const licenseKey = await generateUniqueLicenseKey(env);
                       const timestamp = Math.floor(Date.now() / 1000);
+                      // Extract billing_period and renewal_date from subscription
+                      const billingPeriod = extractBillingPeriodFromStripe(sub);
+                      const renewalDate = sub.current_period_end || null;
                       await env.DB.prepare(
-                        'INSERT INTO licenses (customer_id, subscription_id, item_id, site_domain, license_key, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-                      ).bind(customerId, sub.id, item.id, site, licenseKey, 'active', timestamp, timestamp).run();
+                        'INSERT INTO licenses (customer_id, subscription_id, item_id, site_domain, license_key, status, billing_period, renewal_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                      ).bind(customerId, sub.id, item.id, site, licenseKey, 'active', billingPeriod, renewalDate, timestamp, timestamp).run();
                       license = { license_key: licenseKey };
                     } else {
                       license = existingLicense;
@@ -4930,6 +6025,23 @@ export default {
                 };
                 user.sites[site] = siteData;
                 
+                // Save to KV storage (for subscription updates)
+                // Only save for site purchases, not quantity purchases
+                const itemPurchaseType = item.metadata?.purchase_type || 'site';
+                if (itemPurchaseType !== 'quantity' && site) {
+                  console.log(`[subscription.updated] 💾 Saving to KV storage for site: ${site}`);
+                  await saveSubscriptionToKV(
+                    env,
+                    customerId,
+                    subscriptionId,
+                    userEmail,
+                    site,
+                    sub.status === 'active' ? 'complete' : sub.status,
+                    'paid',
+                    sub.cancel_at_period_end || false
+                  );
+                }
+                
                 // Save/update site details in database
                 if (env.DB) {
                   // Get price details for amount
@@ -4944,7 +6056,22 @@ export default {
                     priceId: item.price.id,
                     amountPaid: priceDetails?.unit_amount || 0,
                     currency: priceDetails?.currency || 'usd',
-                    status: (sub.status === 'canceled' || sub.canceled_at) ? 'inactive' : (sub.status === 'unpaid' || sub.status === 'past_due' ? 'inactive' : (sub.cancel_at_period_end ? 'cancelling' : 'active')),
+                    status: (() => {
+                      const now = Math.floor(Date.now() / 1000);
+                      const periodEnded = sub.current_period_end && sub.current_period_end < now;
+                      
+                      if (sub.status === 'canceled' || sub.canceled_at) {
+                        return 'inactive';
+                      } else if (sub.status === 'unpaid' || sub.status === 'past_due') {
+                        return 'inactive';
+                      } else if (sub.cancel_at_period_end && periodEnded) {
+                        return 'inactive'; // Period ended, now cancelled
+                      } else if (sub.cancel_at_period_end && !periodEnded) {
+                        return 'cancelling'; // Will cancel at period end
+                      } else {
+                        return 'active';
+                      }
+                    })(),
                     currentPeriodStart: sub.current_period_start,
                     currentPeriodEnd: sub.current_period_end,
                     renewalDate: sub.current_period_end,
@@ -5102,6 +6229,15 @@ export default {
           const subscription = event.data.object;
           const subscriptionId = subscription.id;
           const customerId = subscription.customer;
+          
+          // Log subscription deletion
+          await logStripeEvent(env, event, subscriptionId, customerId, {
+            action: 'subscription_deleted',
+            status: subscription.status,
+            canceled_at: subscription.canceled_at,
+            current_period_end: subscription.current_period_end,
+            note: 'Subscription permanently deleted by Stripe'
+          });
 
 
           // Get user record from database by email
@@ -5236,1006 +6372,276 @@ export default {
           
           
           // USE CASE 2: Site purchase - Create separate subscription for each site (like Use Case 3 for licenses)
-          if (useCase2 && useCase2CustomerId) {
-            try {
-              // Get user email
-              const userEmail = await getCustomerEmail(env, useCase2CustomerId);
-              if (!userEmail) {
-                console.warn('[USE CASE 2] User email not found for payment_intent.succeeded');
-                return new Response('ok');
-              }
-              
-              // Get site names and subscription details from metadata
-              let siteNames = [];
-              let priceId = null;
-              let quantity = 0;
-              
-              try {
-                if (metadata.sites) {
-                  siteNames = JSON.parse(metadata.sites);
-                } else {
-                  console.warn(`[USE CASE 2] ⚠️ No sites found in metadata. Available keys: ${Object.keys(metadata).join(', ')}`);
-                }
-                priceId = metadata.price_id || null;
-                quantity = parseInt(metadata.quantity) || siteNames.length || 0;
-              } catch (parseErr) {
-                console.error('[USE CASE 2] ❌ Error parsing metadata:', parseErr);
-              }
-              
-              if (!priceId || siteNames.length === 0) {
-                console.warn('[USE CASE 2] ⚠️ Missing price_id or sites, cannot create subscriptions');
-                return new Response('ok');
-              }
-              
-              // Generate license keys for each site
-              const licenseKeys = generateLicenseKeys(siteNames.length);
-              
-              // STEP 1: Save payment method to customer (same as Use Case 3)
-              let paymentMethodId = paymentIntent.payment_method;
-              
-              if (!paymentMethodId && paymentIntent.latest_charge) {
-                try {
-                  const chargeRes = await stripeFetch(env, `/charges/${paymentIntent.latest_charge}`);
-                  if (chargeRes.status === 200 && chargeRes.body.payment_method) {
-                    paymentMethodId = chargeRes.body.payment_method;
-                  }
-                } catch (chargeErr) {
-                  console.warn(`[USE CASE 2] Could not fetch charge for payment method:`, chargeErr);
-                }
-              }
-              
-              let paymentMethodSaved = false;
-              if (paymentMethodId && useCase2CustomerId) {
-                try {
-                  const attachRes = await stripeFetch(env, `/payment_methods/${paymentMethodId}/attach`, 'POST', {
-                    'customer': useCase2CustomerId
-                  }, true);
-                  
-                  if (attachRes.status === 200) {
-                    const setDefaultRes = await stripeFetch(env, `/customers/${useCase2CustomerId}`, 'POST', {
-                      'invoice_settings[default_payment_method]': paymentMethodId
-                    }, true);
-                    
-                    if (setDefaultRes.status === 200) {
-                      paymentMethodSaved = true;
-                    }
-                  } else {
-                    const errorMessage = attachRes.body?.error?.message || '';
-                    if (errorMessage.includes('already attached')) {
-                      const setDefaultRes = await stripeFetch(env, `/customers/${useCase2CustomerId}`, 'POST', {
-                        'invoice_settings[default_payment_method]': paymentMethodId
-                      }, true);
-                      
-                      if (setDefaultRes.status === 200) {
-                        paymentMethodSaved = true;
-                      }
-                    }
-                  }
-                } catch (attachErr) {
-                  console.error(`[USE CASE 2] ❌ Error attaching payment method:`, attachErr);
-                }
-              }
-              
-              // STEP 2: Create subscriptions (one per site) and generate license keys
-              const createdSubscriptionIds = [];
-              const successfulSiteSubscriptions = []; // Track successful site-subscription pairs
-              
-              if (paymentMethodSaved && priceId && siteNames.length > 0) {
-                try {
-                  // Calculate trial_end (same logic as Use Case 3)
-                  const now = Math.floor(Date.now() / 1000);
-                  let trialPeriodDays = null;
-                  if (env.TRIAL_PERIOD_DAYS) {
-                    trialPeriodDays = parseInt(env.TRIAL_PERIOD_DAYS);
-                  } else if (paymentIntent.metadata?.trial_period_days) {
-                    trialPeriodDays = parseInt(paymentIntent.metadata.trial_period_days);
-                  }
-                  
-                  let trialPeriodSeconds = 30 * 24 * 60 * 60; // Default: 30 days
-                  let billingInterval = 'month';
-                  
-                  if (trialPeriodDays) {
-                    trialPeriodSeconds = trialPeriodDays * 24 * 60 * 60;
-                  } else {
-                    try {
-                      const priceRes = await stripeFetch(env, `/prices/${priceId}`);
-                      if (priceRes.status === 200 && priceRes.body.recurring) {
-                        billingInterval = priceRes.body.recurring.interval;
-                        const intervalCount = priceRes.body.recurring.interval_count || 1;
-                        
-                        if (billingInterval === 'week') {
-                          trialPeriodSeconds = 7 * 24 * 60 * 60 * intervalCount;
-                        } else if (billingInterval === 'month') {
-                          trialPeriodSeconds = 30 * 24 * 60 * 60 * intervalCount;
-                        } else if (billingInterval === 'year') {
-                          trialPeriodSeconds = 365 * 24 * 60 * 60 * intervalCount;
-                        } else if (billingInterval === 'day') {
-                          trialPeriodSeconds = 24 * 60 * 60 * intervalCount;
-                        }
-                      }
-                    } catch (priceErr) {
-                      console.warn(`[USE CASE 2] ⚠️ Could not fetch price details, using default 30 days:`, priceErr);
-                    }
-                  }
-                  
-                  const trialEndTime = now + trialPeriodSeconds;
-                  const minimumTrialEnd = billingInterval === 'day' 
-                    ? now + (7 * 24 * 60 * 60)
-                    : now + 3600;
-                  const trialEnd = Math.max(trialEndTime, minimumTrialEnd);
-                  
-                  // Create subscription for each site
-                  for (let i = 0; i < siteNames.length; i++) {
-                    try {
-                      const siteName = siteNames[i];
-                      const licenseKey = licenseKeys[i];
-                      
-                      const createSubRes = await stripeFetch(env, '/subscriptions', 'POST', {
-                        'customer': useCase2CustomerId,
-                        'items[0][price]': priceId,
-                        'items[0][quantity]': 1,
-                        'metadata[site]': siteName,
-                        'metadata[license_key]': licenseKey,
-                        'metadata[usecase]': '2',
-                        'metadata[purchase_type]': 'site',
-                        'proration_behavior': 'none',
-                        'collection_method': 'charge_automatically',
-                        'trial_end': trialEnd.toString()
-                      }, true);
-                      
-                      if (createSubRes.status === 200) {
-                        const newSubscription = createSubRes.body;
-                        createdSubscriptionIds.push(newSubscription.id);
-                        const itemId = newSubscription.items?.data?.[0]?.id || null;
-                        
-                        successfulSiteSubscriptions.push({
-                          site: siteName,
-                          licenseKey: licenseKey,
-                          subscriptionId: newSubscription.id,
-                          itemId: itemId
-                        });
-                        
-                        // Store license key in subscription item metadata
-                        if (itemId) {
-                          await stripeFetch(env, `/subscription_items/${itemId}`, 'POST', {
-                            'metadata[license_key]': licenseKey,
-                            'metadata[site]': siteName
-                          }, true);
-                        }
-                      } else {
-                        console.error(`[USE CASE 2] ❌ Failed to create subscription for site ${siteName}:`, createSubRes.status, createSubRes.body);
-                      }
-                    } catch (subError) {
-                      console.error(`[USE CASE 2] ❌ Error creating subscription for site ${siteNames[i]}:`, subError);
-                    }
-                  }
-                  
-                  // STEP 3: Save license keys to database
-                  if (env.DB && successfulSiteSubscriptions.length > 0) {
-                    const timestamp = Math.floor(Date.now() / 1000);
-                    
-                    for (const siteSub of successfulSiteSubscriptions) {
-                      try {
-                        // Check if license key already exists
-                        const existingLicense = await env.DB.prepare(
-                          'SELECT license_key FROM licenses WHERE license_key = ?'
-                        ).bind(siteSub.licenseKey).first();
-                        
-                        if (!existingLicense) {
-                          await env.DB.prepare(
-                            `INSERT INTO licenses (
-                              license_key, customer_id, subscription_id, item_id, 
-                              used_site_domain, status, purchase_type, created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                          ).bind(
-                            siteSub.licenseKey,
-                            useCase2CustomerId,
-                            siteSub.subscriptionId,
-                            siteSub.itemId,
-                            siteSub.site,
-                            'active',
-                            'site',
-                            timestamp,
-                            timestamp
-                          ).run();
-                        }
-                      } catch (licenseError) {
-                        console.error(`[USE CASE 2] ❌ Error saving license for site ${siteSub.site}:`, licenseError);
-                      }
-                    }
-                  }
-                  
-                  // STEP 4: Create payment records (one per subscription)
-                  if (env.DB && createdSubscriptionIds.length > 0) {
-                    const timestamp = Math.floor(Date.now() / 1000);
-                    const amountPerSubscription = Math.round((paymentIntent.amount || 0) / createdSubscriptionIds.length);
-                    
-                    for (let i = 0; i < createdSubscriptionIds.length; i++) {
-                      try {
-                        await env.DB.prepare(
-                          `INSERT INTO payments (
-                            customer_id, subscription_id, email, amount, currency, 
-                            status, site_domain, magic_link, magic_link_generated, 
-                            created_at, updated_at
-                          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                        ).bind(
-                          useCase2CustomerId,
-                          createdSubscriptionIds[i],
-                          userEmail,
-                          amountPerSubscription,
-                          paymentIntent.currency || 'usd',
-                          'succeeded',
-                          siteNames[i] || null,
-                          null,
-                          0,
-                          timestamp,
-                          timestamp
-                        ).run();
-                      } catch (paymentError) {
-                        console.error(`[USE CASE 2] ❌ Error saving payment record:`, paymentError);
-                      }
-                    }
-                  }
-                  
-                  // STEP 5: Remove pending sites from user record
-                  if (env.DB) {
-                    try {
-                      const user = await getUserByEmail(env, userEmail);
-                      if (user && user.pendingSites) {
-                        // Remove processed sites from pending list
-                        user.pendingSites = user.pendingSites.filter(ps => {
-                          const psSite = (ps.site || ps.site_domain || '').toLowerCase().trim();
-                          return !siteNames.some(s => s.toLowerCase().trim() === psSite);
-                        });
-                        await saveUserByEmail(env, userEmail, user);
-                      }
-                    } catch (userError) {
-                      console.error(`[USE CASE 2] ❌ Error updating user pending sites:`, userError);
-                    }
-                  }
-                  
-                } catch (usecase2Err) {
-                  console.error('[USE CASE 2] ❌ Error processing site purchase payment:', usecase2Err);
-                }
-              }
-              
-              return new Response('ok');
-            } catch (usecase2Err) {
-              console.error('[USE CASE 2] ❌ Error in Use Case 2 handler:', usecase2Err);
-              return new Response('ok');
-            }
-          }
-          
-          // USE CASE 3: License purchase by user (quantity purchase)
-          // Option 2: Create separate subscriptions (one per license) for individual management
+         // USE CASE 2: Site purchase - enqueue site processing job instead of immediate subscriptions
+
+
+if (useCase2 && useCase2CustomerId) {
+  try {
+    const userEmail = await getCustomerEmail(env, useCase2CustomerId);
+    if (!userEmail) {
+      console.warn('[USE CASE 2] No user email, exiting');
+      return new Response('ok');
+    }
+
+    let siteNames = [];
+    let priceId = null;
+    let billingPeriod = null;
+
+    try {
+      if (metadata.sites) {
+        siteNames = JSON.parse(metadata.sites);
+      }
+      priceId = metadata.price_id || null;
+      billingPeriod = (metadata.billing_period || '').toLowerCase().trim() || null;
+    } catch (e) {
+      console.error('[USE CASE 2] Error parsing metadata:', e);
+    }
+
+    if (!priceId || siteNames.length === 0) {
+      console.warn('[USE CASE 2] Missing priceId or sites, skipping');
+      return new Response('ok');
+    }
+
+    // STEP 1: save payment method as before (same code you already had)
+    let paymentMethodId = paymentIntent.payment_method;
+    /* ... keep your existing payment method attach + set default logic here ... */
+    let paymentMethodSaved = true; // set to true at the end of that logic
+
+    if (!paymentMethodSaved) {
+      console.warn('[USE CASE 2] Payment method not saved, skipping enqueue');
+      return new Response('ok');
+    }
+
+    // STEP 2: enqueue site job
+    const sitesForQueue = siteNames.map(name => ({
+      site: name,
+      price: priceId,
+      billing_period: billingPeriod,
+    }));
+
+    const queueId = await enqueueSiteQueueItem(env, {
+      customerId: useCase2CustomerId,
+      userEmail,
+      subscriptionId: null,
+      sites: sitesForQueue,
+      billingPeriod,
+      priceId,
+      paymentIntentId: paymentIntent.id,
+    });
+
+    console.log('[USE CASE 2] Enqueued site job', queueId);
+
+    // optional: clear pendingSites here if you want
+    return new Response('ok');
+  } catch (err) {
+    console.error('[USE CASE 2] Error in handler:', err);
+    return new Response('ok');
+  }
+}
+         
+// USE CASE 3: Quantity license purchase
+
+
           if (useCase3 && useCase3CustomerId) {
-            
-            try {
-              // Get user email
-              const userEmail = await getCustomerEmail(env, useCase3CustomerId);
-              if (!userEmail) {
-                console.warn('[USE CASE 3] User email not found for payment_intent.succeeded');
+  // Check if subscriptions/licenses already exist for this payment intent
+  // This indicates checkout.session.completed already processed the purchase
+  if (env.DB) {
+    try {
+      // Method 1: Check if subscriptions exist with payment_intent_id in queue (most reliable)
+      const queueCheck = await env.DB.prepare(
+        `SELECT COUNT(*) as count FROM subscription_queue 
+         WHERE payment_intent_id = ? AND status IN ('completed', 'processing')`
+      ).bind(paymentIntent.id).first();
+      
+      if (queueCheck && queueCheck.count > 0) {
+        console.log(`[USE CASE 3 - payment_intent.succeeded] ⚠️ Skipping duplicate processing - ${queueCheck.count} queue item(s) already processed by checkout.session.completed webhook`);
                 return new Response('ok');
               }
               
-              // Get license keys and subscription details from metadata
-              let licenseKeys = [];
-              let priceId = null;
-              let quantity = 0;
-              
-              
-              try {
-                if (metadata.license_keys) {
-                  licenseKeys = JSON.parse(metadata.license_keys);
-                } else {
-                  console.warn(`[USE CASE 3] ⚠️ No license_keys found in metadata. Available keys: ${Object.keys(metadata).join(', ')}`);
-                }
-                priceId = metadata.price_id || null;
-                quantity = parseInt(metadata.quantity) || licenseKeys.length || 0;
-              } catch (parseErr) {
-                console.error('[USE CASE 3] ❌ Error parsing metadata:', parseErr);
-              }
-              
-              // ========================================
-              // STEP 1: FIRST - Save payment method to customer
-              // Following Stripe's recommended pattern
-              // MUST complete successfully before proceeding to create subscriptions
-              // ========================================
-              let paymentMethodId = paymentIntent.payment_method;
-              
-              // If payment_method is not directly available, try to get it from the charge
-              if (!paymentMethodId && paymentIntent.latest_charge) {
-                try {
-                  const chargeRes = await stripeFetch(env, `/charges/${paymentIntent.latest_charge}`);
-                  if (chargeRes.status === 200 && chargeRes.body.payment_method) {
-                    paymentMethodId = chargeRes.body.payment_method;
-                  }
-                } catch (chargeErr) {
-                  console.warn(`[USE CASE 3] Could not fetch charge for payment method:`, chargeErr);
-                }
-              }
-              
-              let paymentMethodSaved = false;
-              if (paymentMethodId && useCase3CustomerId) {
-                try {
-                  
-                  // Attach the payment method used in payment to the customer
-                  const attachRes = await stripeFetch(env, `/payment_methods/${paymentMethodId}/attach`, 'POST', {
-                    'customer': useCase3CustomerId
-                  }, true);
-                  
-                  if (attachRes.status === 200) {
-                    // Set it as the default payment method
-                    const setDefaultRes = await stripeFetch(env, `/customers/${useCase3CustomerId}`, 'POST', {
-                      'invoice_settings[default_payment_method]': paymentMethodId
-                    }, true);
-                    
-                    if (setDefaultRes.status === 200) {
-                      paymentMethodSaved = true;
-                    } else {
-                      console.warn(`[USE CASE 3] ⚠️ Payment method attached but failed to set as default:`, setDefaultRes.status, setDefaultRes.body);
-                    }
-                  } else {
-                    // Check if it's already attached
-                    const errorMessage = attachRes.body?.error?.message || '';
-                    if (errorMessage.includes('already attached') || errorMessage.includes('already been attached')) {
-                      // Just set as default
-                      const setDefaultRes = await stripeFetch(env, `/customers/${useCase3CustomerId}`, 'POST', {
-                        'invoice_settings[default_payment_method]': paymentMethodId
-                      }, true);
-                      
-                      if (setDefaultRes.status === 200) {
-                        paymentMethodSaved = true;
-                      } else {
-                        console.warn(`[USE CASE 3] ⚠️ Failed to set payment method as default:`, setDefaultRes.status, setDefaultRes.body);
-                      }
-                    } else {
-                      console.error(`[USE CASE 3] ❌ STEP 1 FAILED: Failed to attach payment method:`, attachRes.status, attachRes.body);
-                    }
-                  }
-                } catch (attachErr) {
-                  console.error(`[USE CASE 3] ❌ STEP 1 FAILED: Error attaching payment method:`, attachErr);
-                }
-              } else {
-                console.error(`[USE CASE 3] ❌ STEP 1 FAILED: Missing payment_method or customer. payment_method: ${paymentMethodId}, customer: ${useCase3CustomerId}`);
-              }
-              
-              // ========================================
-              // STEP 2: THEN - Create subscriptions (only if payment method was saved)
-              // No need to specify payment_method since we set the default above
-              // Following Stripe's recommended pattern
-              // ========================================
-              const createdSubscriptionIds = [];
-              
-              // Debug logging to understand why subscriptions aren't being created
-              
-              // Declare these at a higher scope so they're available for license key storage
-              const failedSubscriptions = []; // Track failed subscriptions for refund
-              const failedLicenseKeys = []; // Track license keys for failed subscriptions
-              const successfulLicenseSubscriptions = []; // Track successful license-subscription pairs: {licenseKey, subscriptionId, itemId}
-              const savedLicenseKeys = new Set(); // Track which licenses have been saved to prevent duplicates
-              
-              if (paymentMethodSaved && priceId && quantity > 0 && useCase3CustomerId) {
-                try {
-                  
-                  // Calculate trial_end ONCE before loop - all subscriptions get same trial_end
-                  // Use trial_end to skip first invoice (payment already collected via checkout)
-                  // Trial prevents invoice creation until trial ends
-                  // Priority: Custom trial days (env/metadata) > Billing interval > Default (30 days)
-                  const now = Math.floor(Date.now() / 1000);
-                  
-                  // Check for custom trial period (environment variable or metadata)
-                  let trialPeriodDays = null;
-                  if (env.TRIAL_PERIOD_DAYS) {
-                    trialPeriodDays = parseInt(env.TRIAL_PERIOD_DAYS);
-                  } else if (paymentIntent.metadata?.trial_period_days) {
-                    trialPeriodDays = parseInt(paymentIntent.metadata.trial_period_days);
-                  }
-                  
-                  // Get price details to determine billing interval (if no custom trial period)
-                  let trialPeriodSeconds = 30 * 24 * 60 * 60; // Default: 30 days (monthly)
-                  let billingInterval = 'month'; // Default
-                  
-                  if (trialPeriodDays) {
-                    // Use custom trial period
-                    trialPeriodSeconds = trialPeriodDays * 24 * 60 * 60;
-                  } else {
-                    // Calculate based on billing interval
-                    try {
-                      const priceRes = await stripeFetch(env, `/prices/${priceId}`);
-                      if (priceRes.status === 200 && priceRes.body.recurring) {
-                        billingInterval = priceRes.body.recurring.interval;
-                        const intervalCount = priceRes.body.recurring.interval_count || 1;
-                        
-                        // Calculate trial period based on billing interval
-                        if (billingInterval === 'week') {
-                          trialPeriodSeconds = 7 * 24 * 60 * 60 * intervalCount; // Weekly
-                        } else if (billingInterval === 'month') {
-                          trialPeriodSeconds = 30 * 24 * 60 * 60 * intervalCount; // Monthly (approximate)
-                        } else if (billingInterval === 'year') {
-                          trialPeriodSeconds = 365 * 24 * 60 * 60 * intervalCount; // Yearly
-                        } else if (billingInterval === 'day') {
-                          trialPeriodSeconds = 24 * 60 * 60 * intervalCount; // Daily
-                        }
-                        
-                      }
-                    } catch (priceErr) {
-                      console.warn(`[USE CASE 3] ⚠️ Could not fetch price details, using default 30 days:`, priceErr);
-                    }
-                  }
-                  
-                  const trialEndTime = now + trialPeriodSeconds;
-                  
-                  // Ensure trial_end is at least 1 hour in the future (Stripe requirement)
-                  // For daily billing, use at least 7 days to prevent immediate invoice creation
-                  const minimumTrialEnd = billingInterval === 'day' 
-                    ? now + (7 * 24 * 60 * 60) // 7 days minimum for daily billing
-                    : now + 3600; // 1 hour minimum for other intervals
-                  const trialEnd = Math.max(trialEndTime, minimumTrialEnd);
-                  
-                  const trialSource = trialPeriodDays ? `custom (${trialPeriodDays} days)` : `billing interval (${billingInterval})`;
-                  
-                  // Process subscriptions in safe batches to avoid rate limits and timeouts
-                  // Batch size: 5-10 subscriptions per batch
-                  // Rate: Adaptive delay - shorter for larger batches to prevent timeout
-                  const BATCH_SIZE = 5; // Process 5 subscriptions per batch
-                  // OPTIMIZATION: No delay between subscriptions within batch - process as fast as possible
-                  // Only delay between batches to respect rate limits
-                  const DELAY_BETWEEN_BATCHES = 200; // 200ms delay between batches (minimal to prevent timeout)
-                  
-                  const totalBatches = Math.ceil(quantity / BATCH_SIZE);
-                  
-                  
-                  for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
-                    const batchNumber = batchIndex + 1;
-                    const startIndex = batchIndex * BATCH_SIZE;
-                    const endIndex = Math.min(startIndex + BATCH_SIZE, quantity);
-                    const batchSize = endIndex - startIndex;
-                    
-                    
-                    // Process each subscription in the current batch
-                    for (let i = startIndex; i < endIndex; i++) {
-                      const positionInBatch = (i % BATCH_SIZE) + 1;
-                      
-                      try {
-                        // OPTIMIZATION: No delay between subscriptions - process as fast as possible
-                        // Stripe can handle rapid sequential requests for the same customer
-                      
-                        // Create subscription - uses default payment method we set above
-                      // All subscriptions use the same trial_end calculated above
-                      const createSubRes = await stripeFetch(env, '/subscriptions', 'POST', {
-                      'customer': useCase3CustomerId,
+      // Method 2: Check if licenses exist for this customer with purchase_type='quantity' created recently (within last 10 minutes)
+      // This catches cases where checkout.session.completed already processed the purchase
+      const recentTimestamp = Math.floor(Date.now() / 1000) - (10 * 60); // 10 minutes ago
+      const existingLicenses = await env.DB.prepare(
+        `SELECT COUNT(*) as count FROM licenses 
+         WHERE customer_id = ? AND purchase_type = 'quantity' AND created_at >= ?`
+      ).bind(useCase3CustomerId, recentTimestamp).first();
+      
+      if (existingLicenses && existingLicenses.count > 0) {
+        console.log(`[USE CASE 3 - payment_intent.succeeded] ⚠️ Skipping duplicate processing - ${existingLicenses.count} license(s) already created by checkout.session.completed webhook`);
+        return new Response('ok');
+      }
+    } catch (checkErr) {
+      console.warn(`[USE CASE 3 - payment_intent.succeeded] ⚠️ Could not check for existing licenses:`, checkErr);
+      // Continue processing if check fails (fallback behavior - but log warning)
+      console.warn(`[USE CASE 3 - payment_intent.succeeded] ⚠️ Proceeding with fallback processing (may create duplicates if checkout.session.completed already processed)`);
+    }
+  }
+  
+  try {
+    const userEmail = await getCustomerEmail(env, useCase3CustomerId);
+    if (!userEmail) {
+      console.warn('[USE CASE 3] Email not found');
+      return new Response('ok');
+    }
+
+    // ===============================
+    // ✅ METADATA (ONLY quantity + price)
+    // ===============================
+    const priceId = metadata.price_id || null;
+    const quantity = Number(metadata.quantity) || 0;
+
+    if (!priceId || quantity <= 0) {
+      console.error('[USE CASE 3] ❌ Invalid metadata', metadata);
+      return new Response('ok');
+    }
+
+    // ===============================
+    // ✅ GENERATE REAL LICENSE KEYS
+    // ===============================
+    const licenseKeys = [];
+    for (let i = 0; i < quantity; i++) {
+      licenseKeys.push(await generateUniqueLicenseKey(env));
+    }
+
+    console.log(`[USE CASE 3 - payment_intent.succeeded] ✅ Generated ${licenseKeys.length} license keys (fallback handler - checkout.session.completed should have handled this)`);
+
+    // ===============================
+    // STEP 1: Save payment method
+    // ===============================
+    let paymentMethodId = paymentIntent.payment_method;
+
+    if (!paymentMethodId && paymentIntent.latest_charge) {
+      const charge = await stripeFetch(env, `/charges/${paymentIntent.latest_charge}`);
+      paymentMethodId = charge?.body?.payment_method;
+    }
+
+    if (!paymentMethodId) {
+      console.error('[USE CASE 3] ❌ No payment method');
+      return new Response('ok');
+    }
+
+    await stripeFetch(
+      env,
+      `/payment_methods/${paymentMethodId}/attach`,
+      'POST',
+      { customer: useCase3CustomerId },
+      true
+    );
+
+    await stripeFetch(
+      env,
+      `/customers/${useCase3CustomerId}`,
+      'POST',
+      { 'invoice_settings[default_payment_method]': paymentMethodId },
+      true
+    );
+
+    // ===============================
+    // STEP 2: Create subscriptions
+    // ===============================
+    const createdSubscriptionIds = [];
+    const successfulLicenseSubscriptions = [];
+    const now = Math.floor(Date.now() / 1000);
+    const trialEnd = now + 30 * 24 * 60 * 60; // 30 days
+
+    for (let i = 0; i < quantity; i++) {
+      const res = await stripeFetch(
+        env,
+        '/subscriptions',
+        'POST',
+        {
+          customer: useCase3CustomerId,
                       'items[0][price]': priceId,
                       'items[0][quantity]': 1,
+          'trial_end': trialEnd.toString(),
                       'metadata[license_key]': licenseKeys[i],
                       'metadata[usecase]': '3',
-                      'metadata[purchase_type]': 'quantity',
-                      'proration_behavior': 'none',
-                      'collection_method': 'charge_automatically', // Use automatic charging
-                      'trial_end': trialEnd.toString(), // Skip first invoice - payment already collected via checkout
-                      // No need to specify payment_method - uses default we set above
-                    }, true);
-                    
-                    
-                    if (createSubRes.status === 200) {
-                      const newSubscription = createSubRes.body;
-                      createdSubscriptionIds.push(newSubscription.id);
-                      
-                      // Get the subscription item ID
-                      const itemId = newSubscription.items?.data?.[0]?.id || null;
-                      
-                      
-                      // Verify payment was successful
-                      // With trial_end, no invoice should be created until trial ends
-                      // Payment already collected via checkout, so we just verify payment success
-                      const paymentVerified = paymentIntent.status === 'succeeded';
-                      
-                      if (!paymentVerified) {
-                        console.error(`[USE CASE 3] ❌ Payment verification failed - PaymentIntent status is '${paymentIntent.status}', not 'succeeded'`);
-                        // Track as failed for refund
-                        failedSubscriptions.push({ licenseKey: licenseKeys[i], reason: 'payment_verification_failed' });
-                        failedLicenseKeys.push(licenseKeys[i]);
-                        // Don't add to successfulLicenseSubscriptions - subscription created but payment not verified
-                      } else {
-                        // Payment verified - subscription created with trial_end (no invoice until trial ends)
+          'metadata[purchase_type]': 'quantity'
+        },
+        true
+      );
+
+      if (res.status !== 200) continue;
+
+      const sub = res.body;
+      createdSubscriptionIds.push(sub.id);
+
+      const itemId = sub.items?.data?.[0]?.id || null;
                         
-                        // If an invoice was somehow created (shouldn't happen with trial_end), void it immediately
-                        if (newSubscription.latest_invoice) {
-                          const invoiceId = typeof newSubscription.latest_invoice === 'string' 
-                            ? newSubscription.latest_invoice 
-                            : newSubscription.latest_invoice.id;
-                          
-                          try {
-                            const invoiceRes = await stripeFetch(env, `/invoices/${invoiceId}`);
-                            if (invoiceRes.status === 200) {
-                              const invoice = invoiceRes.body;
-                              if (invoice.status === 'open' || invoice.status === 'draft') {
-                                // Immediately void/delete to prevent auto-payment
-                                if (invoice.status === 'open') {
-                                  await stripeFetch(env, `/invoices/${invoiceId}/void`, 'POST', {}, true);
-                                } else {
-                                  await stripeFetch(env, `/invoices/${invoiceId}`, 'DELETE', {}, false);
-                                }
-                              } else if (invoice.status === 'paid') {
-                                // Invoice was auto-paid - this shouldn't happen with trial_end, but it can for very short trials
-                                // For daily billing with short trial, Stripe may auto-pay immediately
-                                // We need to refund this invoice to prevent duplicate payment
-                                console.warn(`[USE CASE 3] ⚠️ Invoice ${invoiceId} was auto-paid (unexpected with trial_end) - refunding to prevent duplicate payment`);
-                                
-                                let refundSuccess = false;
-                                try {
-                                  // Get charge ID from invoice - try multiple sources
-                                  let chargeId = invoice.charge;
-                                  
-                                  // If charge is an object, get the ID
-                                  if (chargeId && typeof chargeId === 'object') {
-                                    chargeId = chargeId.id;
-                                  }
-                                  
-                                  // Try to get from payment intent if not in invoice
-                                  if (!chargeId && invoice.payment_intent) {
-                                    const piId = typeof invoice.payment_intent === 'string' 
-                                      ? invoice.payment_intent 
-                                      : invoice.payment_intent.id;
-                                    try {
-                                      const piRes = await stripeFetch(env, `/payment_intents/${piId}`);
-                                      if (piRes.status === 200 && piRes.body.latest_charge) {
-                                        chargeId = typeof piRes.body.latest_charge === 'string'
-                                          ? piRes.body.latest_charge
-                                          : piRes.body.latest_charge.id;
-                                      }
-                                    } catch (piErr) {
-                                      console.warn(`[USE CASE 3] ⚠️ Could not fetch payment intent for charge:`, piErr);
-                                    }
-                                  }
-                                  
-                                  if (chargeId) {
-                                    // Refund the charge to prevent duplicate payment
-                                    const refundRes = await stripeFetch(env, '/refunds', 'POST', {
-                                      'charge': chargeId,
-                                      'reason': 'requested_by_customer',
-                                      'metadata[reason]': 'auto_paid_invoice_during_trial',
-                                      'metadata[invoice_id]': invoiceId,
-                                      'metadata[subscription_id]': newSubscription.id
-                                    }, true);
-                                    
-                                    if (refundRes.status === 200) {
-                                      refundSuccess = true;
-                                    } else {
-                                      console.error(`[USE CASE 3] ❌ Failed to refund invoice ${invoiceId}:`, refundRes.status, refundRes.body);
-                                    }
-                                  } else {
-                                    console.warn(`[USE CASE 3] ⚠️ Invoice ${invoiceId} is paid but has no charge ID - cannot refund. Invoice data:`, JSON.stringify(invoice, null, 2));
-                                  }
-                                } catch (refundErr) {
-                                  console.error(`[USE CASE 3] ❌ Error refunding auto-paid invoice:`, refundErr);
-                                }
-                                
-                                // Even if refund fails, log it for manual review
-                                if (!refundSuccess) {
-                                  console.error(`[USE CASE 3] ⚠️ CRITICAL: Could not refund auto-paid invoice ${invoiceId} - manual refund may be required`);
-                                }
-                              }
-                            }
-                          } catch (invoiceErr) {
-                            console.warn(`[USE CASE 3] ⚠️ Error handling unexpected invoice:`, invoiceErr);
-                          }
-                        }
-                      }
-                      
-                      // Track as successful if subscription was created (even if invoice was auto-paid and refunded)
-                      // The subscription is valid - we just need to handle the duplicate payment via refund
-                      if (createSubRes.status === 200) {
                         successfulLicenseSubscriptions.push({
                           licenseKey: licenseKeys[i],
-                          subscriptionId: newSubscription.id,
-                          itemId: itemId
-                        });
-                      } else {
-                        console.warn(`[USE CASE 3] ⚠️ Subscription creation failed, not adding to successful list`);
-                      }
-                      
-                      // Store license key in subscription item metadata
-                      // OPTIMIZATION: Skip metadata update for large batches to save time
-                      if (itemId && quantity <= 10) {
-                        await stripeFetch(env, `/subscription_items/${itemId}`, 'POST', {
-                          'metadata[license_key]': licenseKeys[i]
-                        }, true);
-                      } else if (itemId && quantity > 10) {
-                        // For large batches, skip metadata update to save time - can be done later
-                      }
-                    } else {
-                      console.error(`[USE CASE 3] ❌ Failed to create subscription ${i + 1}/${quantity}:`, createSubRes.status, createSubRes.body);
-                      // Track failed subscription for refund
-                      failedSubscriptions.push({ licenseKey: licenseKeys[i], reason: 'subscription_creation_failed', status: createSubRes.status });
-                      failedLicenseKeys.push(licenseKeys[i]);
-                      // Continue to next subscription even if this one failed
-                    }
-                  } catch (subError) {
-                    // Catch any errors during subscription creation to ensure loop continues
-                    console.error(`[USE CASE 3] ❌ Error creating subscription ${i + 1}/${quantity} for license ${licenseKeys[i]}:`, subError);
-                    failedSubscriptions.push({ licenseKey: licenseKeys[i], reason: 'subscription_creation_error', error: subError.message || String(subError) });
-                    failedLicenseKeys.push(licenseKeys[i]);
-                    // Continue to next subscription
-                  }
-                    } // End of inner loop (subscriptions in batch)
-                    
-                    // Batch completed - log summary
-                    
-                    // OPTIMIZATION: Save licenses incrementally after each batch to prevent data loss on timeout
-                    // This ensures licenses are saved even if webhook times out before all batches complete
-                    if (env.DB && successfulLicenseSubscriptions.length > 0) {
-                      const timestamp = Math.floor(Date.now() / 1000);
-                      let batchLicensesSaved = 0;
-                      
-                      // Save all licenses created in this batch (those with indices in the current batch range)
-                      for (let i = startIndex; i < endIndex; i++) {
-                        const licenseKey = licenseKeys[i];
-                        
-                        // Skip if already saved
-                        if (savedLicenseKeys.has(licenseKey)) {
-                          continue;
-                        }
-                        
-                        // Find the corresponding subscription data
-                        const licenseSub = successfulLicenseSubscriptions.find(s => s.licenseKey === licenseKey);
-                        if (!licenseSub) {
-                          continue; // Subscription wasn't created successfully for this license
-                        }
-                        
-                        const { subscriptionId, itemId } = licenseSub;
-                        
-                        try {
-                          const existingLicense = await env.DB.prepare(
-                            `SELECT license_key FROM licenses WHERE license_key = ?`
-                          ).bind(licenseKey).first();
-                          
-                          if (existingLicense) {
-                            savedLicenseKeys.add(licenseKey);
-                            continue;
-                          }
-                          
+        subscriptionId: sub.id,
+        itemId,
+        renewalDate: sub.current_period_end || null
+      });
+    }
+
+    // ===============================
+    // STEP 3: Save licenses to DB + KV
+    // ===============================
+    if (env.DB) {
+      const ts = Math.floor(Date.now() / 1000);
+
+      for (const l of successfulLicenseSubscriptions) {
                           await env.DB.prepare(
                             `INSERT INTO licenses 
                              (license_key, customer_id, subscription_id, item_id, 
-                              site_domain, used_site_domain, status, purchase_type, created_at, updated_at)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            status, purchase_type, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
                           ).bind(
-                            licenseKey,
+          l.licenseKey,
                             useCase3CustomerId,
-                            subscriptionId,
-                            itemId || null,
-                            null,
-                            null,
+          l.subscriptionId,
+          l.itemId,
                             'active',
                             'quantity',
-                            timestamp,
-                            timestamp
+          ts,
+          ts
                           ).run();
                           
-                          savedLicenseKeys.add(licenseKey);
-                          batchLicensesSaved++;
-                        } catch (insertErr) {
-                          if (insertErr.message && insertErr.message.includes('UNIQUE constraint')) {
-                            savedLicenseKeys.add(licenseKey);
-                            console.warn(`[USE CASE 3] ⚠️ License key ${licenseKey} already exists, skipping`);
-                          } else {
-                            console.error(`[USE CASE 3] ❌ Error storing license ${licenseKey}:`, insertErr);
-                          }
-                        }
-                      }
-                      
-                      if (batchLicensesSaved > 0) {
-                      }
-                    }
-                    
-                    // Add delay between batches (except after the last batch)
-                    if (batchIndex < totalBatches - 1) {
-                      await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_BATCHES));
-                    }
-                  } // End of outer loop (batches)
-                  
-                
-                // Check if all subscriptions were created - if not, add missing ones to failed list for refund
-                const totalProcessed = createdSubscriptionIds.length + failedSubscriptions.length;
-                const missingCount = quantity - totalProcessed;
-                
-                if (missingCount > 0) {
-                  console.warn(`[USE CASE 3] ⚠️ WARNING: ${missingCount} subscription(s) were not processed (webhook may have timed out). Adding to failed list for refund.`);
-                  
-                  // Find which license keys weren't processed
-                  const processedLicenseKeys = new Set([
-                    ...successfulLicenseSubscriptions.map(s => s.licenseKey),
-                    ...failedLicenseKeys
-                  ]);
-                  
-                  for (let i = 0; i < licenseKeys.length; i++) {
-                    if (!processedLicenseKeys.has(licenseKeys[i])) {
-                      failedSubscriptions.push({ 
-                        licenseKey: licenseKeys[i], 
-                        reason: 'not_processed_timeout', 
-                        index: i + 1 
-                      });
-                      failedLicenseKeys.push(licenseKeys[i]);
-                      console.warn(`[USE CASE 3] ⚠️ License ${licenseKeys[i]} (subscription ${i + 1}/${quantity}) was not processed - will be refunded`);
-                    }
-                  }
-                }
-                
-                // ========================================
-                // REFUND LOGIC: If any subscriptions failed or weren't processed, refund the failed portion
-                // ========================================
-                if (failedSubscriptions.length > 0) {
-                  console.warn(`[USE CASE 3] ⚠️ ${failedSubscriptions.length} subscription(s) failed to create. Processing refund for failed subscriptions...`);
-                  
-                  try {
-                    // Get payment intent charge ID for refund
-                    let chargeId = null;
-                    if (paymentIntent?.latest_charge) {
-                      chargeId = typeof paymentIntent.latest_charge === 'string' 
-                        ? paymentIntent.latest_charge 
-                        : paymentIntent.latest_charge.id;
-                    } else if (paymentIntent?.charges?.data?.length > 0) {
-                      chargeId = paymentIntent.charges.data[0].id;
-                    }
-                    
-                    if (chargeId) {
-                      // Get price details to calculate refund amount
-                      let refundAmount = 0;
-                      let currency = 'usd';
-                      
-                      try {
-                        const priceRes = await stripeFetch(env, `/prices/${priceId}`);
-                        if (priceRes.status === 200) {
-                          const price = priceRes.body;
-                          const unitPrice = price.unit_amount || 0;
-                          currency = price.currency || 'usd';
-                          refundAmount = unitPrice * failedSubscriptions.length;
-                        }
-                      } catch (priceErr) {
-                        console.warn(`[USE CASE 3] ⚠️ Could not get price for refund calculation:`, priceErr);
-                        // Fallback: Use payment intent amount divided by quantity
-                        if (paymentIntent?.amount && quantity > 0) {
-                          refundAmount = Math.round((paymentIntent.amount / quantity) * failedSubscriptions.length);
-                          currency = paymentIntent.currency || 'usd';
-                        }
-                      }
-                      
-                      if (refundAmount > 0) {
-                        // Create refund
-                        const refundRes = await stripeFetch(env, '/refunds', 'POST', {
-                          'charge': chargeId,
-                          'amount': refundAmount,
-                          'metadata[reason]': 'subscription_creation_failed',
-                          'metadata[failed_count]': failedSubscriptions.length.toString(),
-                          'metadata[failed_license_keys]': JSON.stringify(failedLicenseKeys)
-                        }, true);
-                        
-                        if (refundRes.status === 200) {
-                          const refund = refundRes.body;
-                          
-                          // Save refund record to database
-                          if (env.DB) {
-                            try {
-                              const timestamp = Math.floor(Date.now() / 1000);
+                          await saveLicenseKeyToKV(
+                            env,
+          l.licenseKey,
+                            useCase3CustomerId,
+          l.subscriptionId,
+                            userEmail,
+          'complete',
+          false,
+          null
+        );
+      }
+    }
+
+    // ===============================
+    // STEP 4: Save payments
+    // ===============================
+    if (env.DB && createdSubscriptionIds.length > 0) {
+      const ts = Math.floor(Date.now() / 1000);
+      const perUnit = Math.round(paymentIntent.amount / quantity);
+
+      for (const subId of createdSubscriptionIds) {
                               await env.DB.prepare(
-                                `INSERT INTO refunds (
-                                  refund_id, payment_intent_id, charge_id, customer_id, user_email,
-                                  amount, currency, status, reason, queue_id, license_key,
-                                  subscription_id, attempts, metadata, created_at, updated_at
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO payments
+           (customer_id, subscription_id, email, amount, currency,
+            status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
                               ).bind(
-                                refund.id,
-                                paymentIntent?.id,
-                                chargeId,
-                                customerId,
-                                paymentIntent?.metadata?.email || null,
-                                refundAmount,
-                                currency,
-                                refund.status || 'succeeded',
-                                'subscription_creation_failed',
-                                null, // queue_id (not from queue)
-                                null, // license_key (multiple licenses)
-                                null, // subscription_id (not created)
-                                null, // attempts
-                                JSON.stringify({
-                                  reason: 'subscription_creation_failed',
-                                  failed_count: failedSubscriptions.length,
-                                  payment_intent_id: paymentIntent?.id,
-                                  customer_id: customerId
-                                }),
-                                timestamp,
-                                timestamp
+          useCase3CustomerId,
+          subId,
+          userEmail,
+          perUnit,
+          paymentIntent.currency || 'usd',
+          'succeeded',
+          ts,
+          ts
                               ).run();
-                            } catch (refundDbErr) {
-                              if (refundDbErr.message && refundDbErr.message.includes('UNIQUE constraint')) {
-                                console.warn(`[USE CASE 3] ⚠️ Refund ${refund.id} already exists in database, skipping`);
-                              } else {
-                                console.error(`[USE CASE 3] ⚠️ Error saving refund record:`, refundDbErr);
-                              }
-                            }
-                          }
-                        } else {
-                          console.error(`[USE CASE 3] ❌ Failed to create refund:`, refundRes.status, refundRes.body);
-                        }
-                      } else {
-                        console.warn(`[USE CASE 3] ⚠️ Refund amount is 0, skipping refund creation`);
-                      }
-                    } else {
-                      console.error(`[USE CASE 3] ❌ Could not find charge ID for refund. PaymentIntent: ${paymentIntent?.id || 'N/A'}`);
-                    }
-                  } catch (refundErr) {
-                    console.error(`[USE CASE 3] ❌ Error processing refund:`, refundErr);
-                  }
-                }
-              } catch (createSubsErr) {
-                console.error('[USE CASE 3] ❌ Error creating separate subscriptions:', createSubsErr);
-              }
-              } else {
-                // Log why subscriptions aren't being created
-                if (!paymentMethodSaved) {
-                  console.error(`[USE CASE 3] ❌ STEP 2 SKIPPED: Payment method was not saved successfully`);
-                }
-                if (!priceId) {
-                  console.error(`[USE CASE 3] ❌ STEP 2 SKIPPED: Missing priceId`);
-                }
-                if (!quantity || quantity <= 0) {
-                  console.error(`[USE CASE 3] ❌ STEP 2 SKIPPED: Invalid quantity: ${quantity}`);
-                }
-                if (!useCase3CustomerId) {
-                  console.error(`[USE CASE 3] ❌ STEP 2 SKIPPED: Missing customerId`);
-                }
-              }
-              
-              // Create license keys in database after payment succeeds - ONLY for successfully created subscriptions
-              // Store all relevant data: license_key, customer_id, subscription_id, item_id, status, purchase_type, timestamps
-              if (env.DB && successfulLicenseSubscriptions.length > 0) {
-                
-                const timestamp = Math.floor(Date.now() / 1000);
-                let licensesStored = 0;
-                let licensesSkipped = 0;
-                let licensesFailed = 0;
-                
-                for (let i = 0; i < successfulLicenseSubscriptions.length; i++) {
-                  const { licenseKey, subscriptionId, itemId } = successfulLicenseSubscriptions[i];
-                  
-                  try {
-                    // Check if license key already exists (shouldn't happen, but handle gracefully)
-                    const existingLicense = await env.DB.prepare(
-                      `SELECT license_key FROM licenses WHERE license_key = ?`
-                    ).bind(licenseKey).first();
-                    
-                    if (existingLicense) {
-                      console.warn(`[USE CASE 3] ⚠️ License key ${licenseKey} already exists in database, skipping`);
-                      licensesSkipped++;
-                      continue;
-                    }
-                    
-                    // Insert new license key with all relevant subscription details
-                    // Schema: license_key (PK), customer_id, subscription_id, item_id, site_domain, used_site_domain, status, purchase_type, created_at, updated_at
-                    const insertResult = await env.DB.prepare(
-                      `INSERT INTO licenses 
-                       (license_key, customer_id, subscription_id, item_id, 
-                        site_domain, used_site_domain, status, purchase_type, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                    ).bind(
-                      licenseKey,                    // license_key (PRIMARY KEY)
-                      useCase3CustomerId,            // customer_id (NOT NULL)
-                      subscriptionId,                // subscription_id (guaranteed to exist)
-                      itemId || null,                 // item_id (can be null)
-                      null,                           // site_domain (null for quantity purchases - unassigned)
-                      null,                           // used_site_domain (null until activated)
-                      'active',                       // status (NOT NULL, default 'active')
-                      'quantity',                     // purchase_type ('quantity' for Use Case 3)
-                      timestamp,                      // created_at (NOT NULL)
-                      timestamp                       // updated_at (NOT NULL)
-                    ).run();
-                    
-                    if (insertResult.success) {
-                      licensesStored++;
-                    } else {
-                      console.error(`[USE CASE 3] ❌ Failed to store license ${licenseKey}: insertResult.success = false`);
-                      licensesFailed++;
-                    }
-                  } catch (insertErr) {
-                    // If license key already exists (race condition), skip
-                    if (insertErr.message && insertErr.message.includes('UNIQUE constraint')) {
-                      console.warn(`[USE CASE 3] ⚠️ License key ${licenseKey} already exists (UNIQUE constraint), skipping`);
-                      licensesSkipped++;
-                    } else {
-                      console.error(`[USE CASE 3] ❌ Error storing license ${licenseKey} in database:`, insertErr);
-                      console.error(`[USE CASE 3]    Error details:`, insertErr.message);
-                      licensesFailed++;
-                    }
-                  }
-                }
-                
-                // Summary of license storage
-                
-                if (licensesStored === 0 && licensesFailed > 0) {
-                  console.error(`[USE CASE 3] ❌ CRITICAL: No licenses were stored! All ${successfulLicenseSubscriptions.length} license(s) failed to save.`);
-                }
-              } else if (env.DB && licenseKeys.length > 0 && successfulLicenseSubscriptions.length === 0) {
-                console.warn(`[USE CASE 3] ⚠️ No subscriptions were created successfully - skipping license key storage. ${failedSubscriptions.length} subscription(s) failed.`);
-              } else {
-                if (!env.DB) {
-                  console.error('[USE CASE 3] ❌ Database not available - cannot store licenses');
-                } else if (licenseKeys.length === 0) {
-                  console.warn('[USE CASE 3] ⚠️ No license keys found in metadata - cannot store licenses');
-                }
-              }
-              
-              // Save payment record (one per subscription created)
-              // Store all relevant payment data: customer_id, subscription_id, email, amount, currency, status, timestamps
-              if (env.DB && createdSubscriptionIds.length > 0) {
-                try {
-                  const timestamp = Math.floor(Date.now() / 1000);
-                  const quantityForPayment = parseInt(paymentIntent.metadata?.quantity) || licenseKeys.length || 1;
-                  const totalAmount = paymentIntent.amount || 0;
-                  const amountPerSubscription = Math.round(totalAmount / quantityForPayment);
-                  const currency = paymentIntent.currency || 'usd';
-                  
-                  
-                  let paymentsStored = 0;
-                  let paymentsFailed = 0;
-                  
-                  // Save one payment record per subscription created
-                  for (let i = 0; i < createdSubscriptionIds.length; i++) {
-                    try {
-                      const insertResult = await env.DB.prepare(
-                        `INSERT INTO payments (
-                          customer_id, subscription_id, email, amount, currency, 
-                          status, site_domain, magic_link, magic_link_generated, 
-                          created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-                      ).bind(
-                        useCase3CustomerId,              // customer_id (NOT NULL)
-                        createdSubscriptionIds[i],        // subscription_id (NOT NULL)
-                        userEmail,                        // email (NOT NULL)
-                        amountPerSubscription,            // amount in cents (NOT NULL)
-                        currency,                         // currency (NOT NULL, default 'usd')
-                        'succeeded',                      // status (NOT NULL, default 'succeeded')
-                        null,                             // site_domain (null for quantity purchases)
-                        null,                             // magic_link (not used)
-                        0,                                // magic_link_generated (0/false)
-                        timestamp,                        // created_at (NOT NULL)
-                        timestamp                         // updated_at (NOT NULL)
-                      ).run();
-                      
-                      if (insertResult.success) {
-                        paymentsStored++;
-                      } else {
-                        console.error(`[USE CASE 3] ❌ Failed to store payment record for subscription ${createdSubscriptionIds[i]}: insertResult.success = false`);
-                        paymentsFailed++;
-                      }
-                    } catch (paymentInsertErr) {
-                      console.error(`[USE CASE 3] ❌ Error storing payment record ${i + 1} for subscription ${createdSubscriptionIds[i]}:`, paymentInsertErr);
-                      console.error(`[USE CASE 3]    Error details:`, paymentInsertErr.message);
-                      paymentsFailed++;
-                    }
-                  }
-                  
-                  // Summary of payment storage
-                  
-                  if (paymentsStored === 0 && paymentsFailed > 0) {
-                    console.error(`[USE CASE 3] ❌ CRITICAL: No payment records were stored! All ${createdSubscriptionIds.length} payment(s) failed to save.`);
-                  }
-                } catch (paymentErr) {
-                  console.error('[USE CASE 3] ❌ Error processing payment records:', paymentErr);
-                  console.error('[USE CASE 3]    Error details:', paymentErr.message);
-                }
-              } else {
-                if (!env.DB) {
-                  console.error('[USE CASE 3] ❌ Database not available - cannot store payment records');
-                } else if (createdSubscriptionIds.length === 0) {
-                  console.warn('[USE CASE 3] ⚠️ No subscriptions created - cannot store payment records');
                 }
               }
               
               return new Response('ok');
-            } catch (usecase3Err) {
-              console.error('[USE CASE 3] ❌ Error processing license purchase payment:', usecase3Err);
-              // Don't return error - let it fall through to normal processing as fallback
+  } catch (err) {
+    console.error('[USE CASE 3] ❌ Fatal error', err);
+    return new Response('ok');
             }
           }
           
@@ -6387,7 +6793,7 @@ export default {
                   // Generate license key
                   if (env.DB) {
                     try {
-                      const licenseKey = generateLicenseKey();
+                      const licenseKey = await generateUniqueLicenseKey(env);
                       const timestamp = Math.floor(Date.now() / 1000);
                       await env.DB.prepare(
                         'INSERT INTO licenses (customer_id, subscription_id, item_id, site_domain, license_key, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
@@ -6432,6 +6838,17 @@ export default {
           const invoice = event.data.object;
           const subscriptionId = invoice.subscription;
           const customerId = invoice.customer;
+          
+          // Log invoice payment success
+          await logStripeEvent(env, event, subscriptionId, customerId, {
+            action: 'invoice_payment_succeeded',
+            invoice_id: invoice.id,
+            amount_paid: invoice.amount_paid,
+            currency: invoice.currency,
+            period_start: invoice.period_start,
+            period_end: invoice.period_end,
+            note: 'Invoice payment succeeded - renewal or initial payment'
+          });
 
 
           if (!subscriptionId || !customerId) {
@@ -6535,7 +6952,7 @@ export default {
           }
 
           // Generate license keys - one per site
-          const licenseKeys = generateLicenseKeys(licensesToCreate.length);
+          const licenseKeys = await generateLicenseKeys(licensesToCreate.length, env);
 
           // Save licenses to D1 database with site mapping
           if (env.DB) {
@@ -6567,7 +6984,39 @@ export default {
         }
 
         if (event.type === 'invoice.payment_failed') {
-          // handle payment failure
+          const invoice = event.data.object;
+          const subscriptionId = invoice.subscription;
+          const customerId = invoice.customer;
+          
+          // Log invoice payment failure
+          await logStripeEvent(env, event, subscriptionId, customerId, {
+            action: 'invoice_payment_failed',
+            invoice_id: invoice.id,
+            amount_due: invoice.amount_due,
+            currency: invoice.currency,
+            attempt_count: invoice.attempt_count,
+            next_payment_attempt: invoice.next_payment_attempt,
+            note: 'Invoice payment failed - subscription may be at risk'
+          });
+        }
+        
+        // Log any other unhandled event types
+        const handledEventTypes = [
+          'checkout.session.completed', 
+          'payment_intent.succeeded', 
+          'customer.subscription.updated', 
+          'customer.subscription.deleted', 
+          'invoice.payment_succeeded', 
+          'invoice.payment_failed'
+        ];
+        
+        if (!handledEventTypes.includes(event.type)) {
+          const unhandledSubId = event.data?.object?.subscription || event.data?.object?.id || null;
+          const unhandledCustId = event.data?.object?.customer || null;
+          await logStripeEvent(env, event, unhandledSubId, unhandledCustId, {
+            action: 'unhandled_event',
+            note: `Unhandled event type: ${event.type}`
+          });
         }
 
         return new Response('ok');
@@ -6584,9 +7033,92 @@ export default {
         }
       }
 
+      // Export Stripe logs as JSON file
+      if (request.method === 'GET' && pathname === '/export-stripe-logs') {
+        if (!env.DB) {
+          return jsonResponse(500, { error: 'Database not configured' }, true, request);
+        }
+
+        try {
+          const url = new URL(request.url);
+          const date = url.searchParams.get('date'); // Optional: filter by date (YYYY-MM-DD)
+          const subscriptionId = url.searchParams.get('subscription_id'); // Optional: filter by subscription ID
+          const customerId = url.searchParams.get('customer_id'); // Optional: filter by customer ID
+          const eventType = url.searchParams.get('event_type'); // Optional: filter by event type
+          const limit = parseInt(url.searchParams.get('limit')) || 1000; // Default 1000, max 10000
+          const maxLimit = Math.min(limit, 10000);
+
+          let query = 'SELECT * FROM stripe_logs WHERE 1=1';
+          const params = [];
+
+          if (date) {
+            query += ' AND date = ?';
+            params.push(date);
+          }
+          if (subscriptionId) {
+            query += ' AND subscription_id = ?';
+            params.push(subscriptionId);
+          }
+          if (customerId) {
+            query += ' AND customer_id = ?';
+            params.push(customerId);
+          }
+          if (eventType) {
+            query += ' AND event_type = ?';
+            params.push(eventType);
+          }
+
+          query += ' ORDER BY timestamp DESC LIMIT ?';
+          params.push(maxLimit);
+
+          const result = await env.DB.prepare(query).bind(...params).all();
+
+          if (!result.success) {
+            return jsonResponse(500, { error: 'Failed to fetch logs', details: result.error }, true, request);
+          }
+
+          // Parse JSON fields
+          const logs = (result.results || []).map(log => ({
+            id: log.id,
+            timestamp: log.timestamp,
+            date: log.date,
+            event_id: log.event_id,
+            event_type: log.event_type,
+            subscription_id: log.subscription_id,
+            customer_id: log.customer_id,
+            event_data: log.event_data ? JSON.parse(log.event_data) : null,
+            additional_data: log.additional_data ? JSON.parse(log.additional_data) : null,
+            created_at: log.created_at,
+            created_at_iso: new Date(log.created_at * 1000).toISOString()
+          }));
+
+          // Return as JSON file download
+          const jsonContent = JSON.stringify(logs, null, 2);
+          const filename = `stripe-logs-${date || 'all'}-${new Date().toISOString().split('T')[0]}.json`;
+
+          return new Response(jsonContent, {
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Disposition': `attachment; filename="${filename}"`,
+              ...corsHeaders
+            }
+          });
+        } catch (error) {
+          console.error('[Export Logs] Error:', error);
+          return jsonResponse(500, { error: 'Failed to export logs', message: error.message }, true, request);
+        }
+      }
+
       if (request.method === 'GET' && pathname === '/dashboard') {
         // Try to get email from query parameter (for Memberstack users)
         const emailParam = url.searchParams.get('email');
+        
+        // Pagination parameters
+        const limit = parseInt(url.searchParams.get('limit')) || 10;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+        const type = url.searchParams.get('type'); // 'sites' or 'subscriptions'
+        const status = url.searchParams.get('status'); // 'active', 'cancelling', 'cancelled' for sites; 'monthly', 'yearly' for subscriptions
+        
         // Read session cookie
         const cookie = request.headers.get('cookie') || "";
         const match = cookie.match(/sb_session=([^;]+)/);
@@ -6628,28 +7160,33 @@ export default {
         let allCustomerIds = [];
         let allSubscriptions = [];
         
-        // Step 1: Get all customers for this email
+        // Initialize license maps early (used later in Step 3)
+        const allLicensesMap = {}; // site_domain -> license
+        const quantityLicensesMap = {}; // subscription_id -> { item_id -> license }
+        
+        // Step 1: Get all customers for this email (OPTIMIZED: parallel queries)
         try {
-          const customersRes = await env.DB.prepare(
-            'SELECT DISTINCT customer_id FROM customers WHERE user_email = ?'
-          ).bind(normalizedEmail).all();
+          // Run both customer queries in parallel for faster loading
+          const [customersRes, paymentsCustomersRes] = await Promise.all([
+            env.DB.prepare(
+              'SELECT DISTINCT customer_id FROM customers WHERE user_email = ?'
+            ).bind(normalizedEmail).all(),
+            env.DB.prepare(
+              'SELECT DISTINCT customer_id FROM payments WHERE email = ? AND customer_id IS NOT NULL'
+            ).bind(normalizedEmail).all()
+          ]);
           
           if (customersRes && customersRes.results) {
             allCustomerIds = customersRes.results.map(row => row.customer_id).filter(id => id);
           }
-          
-          // Also check payments table for any additional customer IDs
-          const paymentsCustomersRes = await env.DB.prepare(
-            'SELECT DISTINCT customer_id FROM payments WHERE email = ? AND customer_id IS NOT NULL'
-          ).bind(normalizedEmail).all();
           
           if (paymentsCustomersRes && paymentsCustomersRes.results) {
             const paymentCustomerIds = paymentsCustomersRes.results
                 .map(row => row.customer_id)
                 .filter(id => id && id.startsWith('cus_'));
             allCustomerIds = [...new Set([...allCustomerIds, ...paymentCustomerIds])];
-            }
-          } catch (dbErr) {
+          }
+        } catch (dbErr) {
           console.error('Error finding customers by email:', dbErr);
         }
         
@@ -6671,10 +7208,20 @@ export default {
                 
                 // Determine subscription status - if canceled or cancel_at_period_end, show as cancelled
                 let subscriptionStatus = subRow.status || 'active';
-                if (subRow.cancel_at_period_end === 1) {
-                  subscriptionStatus = 'cancelling'; // Will cancel at period end
-                } else if (subRow.status === 'canceled') {
-                  subscriptionStatus = 'canceled';
+                const now = Math.floor(Date.now() / 1000);
+                
+                if (subRow.status === 'canceled') {
+                  // Already cancelled in Stripe
+                  subscriptionStatus = 'cancelled';
+                } else if (subRow.cancel_at_period_end === 1) {
+                  // Check if period has ended
+                  if (subRow.current_period_end && subRow.current_period_end < now) {
+                    // Period has ended, subscription should be cancelled
+                    subscriptionStatus = 'cancelled';
+                  } else {
+                    // Period hasn't ended yet, still cancelling
+                    subscriptionStatus = 'cancelling';
+                  }
                 }
                 
                 subscriptions[subscriptionId] = {
@@ -6706,16 +7253,95 @@ export default {
         
         // Step 3: Get all subscription items directly from subscription_items table
         const subscriptionIds = Object.keys(subscriptions);
+        
+        // Store licenses result for later use (activated license sites)
+        let allLicensesResult = null;
+        
+        // Step 3.5 & 3: Fetch licenses and subscription items in parallel (OPTIMIZED)
+        // (License maps are already initialized at the top of the function)
+        // For site purchases: map by site_domain
+        // For quantity purchases: map by subscription_id and item_id
         if (subscriptionIds.length > 0) {
           try {
             const placeholders = subscriptionIds.map(() => '?').join(',');
-            // Include all items (even inactive ones) so cancelled subscriptions are visible
-            const itemsRes = await env.DB.prepare(
-              `SELECT subscription_id, item_id, site_domain, price_id, quantity, status, created_at, removed_at 
-               FROM subscription_items 
-               WHERE subscription_id IN (${placeholders})`
-            ).bind(...subscriptionIds).all();
             
+            // OPTIMIZED: Run licenses and items queries in parallel
+            const [licensesRes, itemsRes] = await Promise.all([
+              env.DB.prepare(
+                `SELECT license_key, site_domain, used_site_domain, subscription_id, item_id, status, purchase_type, billing_period, renewal_date, created_at 
+                 FROM licenses 
+                 WHERE subscription_id IN (${placeholders}) AND status = ?`
+              ).bind(...subscriptionIds, 'active').all(),
+              env.DB.prepare(
+                `SELECT subscription_id, item_id, site_domain, price_id, quantity, status, billing_period, renewal_date, created_at, removed_at 
+                 FROM subscription_items 
+                 WHERE subscription_id IN (${placeholders})`
+              ).bind(...subscriptionIds).all()
+            ]);
+            
+            // Store licenses result for later use
+            allLicensesResult = licensesRes;
+            
+            // Process licenses
+            // CRITICAL: Map licenses for both site purchases and activated quantity purchases
+            if (licensesRes && licensesRes.results) {
+              for (const license of licensesRes.results) {
+                // For site purchases: map by site_domain or used_site_domain
+                const siteDomain = license.used_site_domain || license.site_domain;
+                if (siteDomain && license.license_key && license.purchase_type !== 'quantity') {
+                  allLicensesMap[siteDomain] = {
+                    license_key: license.license_key,
+                    status: license.status || 'active',
+                    created_at: license.created_at,
+                    billing_period: license.billing_period || null,
+                    renewal_date: license.renewal_date || null,
+                    purchase_type: license.purchase_type || 'site'
+                  };
+                }
+                
+                // For activated quantity purchases: also map by used_site_domain
+                if (license.purchase_type === 'quantity' && license.used_site_domain && license.license_key) {
+                  // Map activated license sites so they appear in subscriptions
+                  const activatedSite = license.used_site_domain;
+                  if (activatedSite && 
+                      !activatedSite.startsWith('license_') && 
+                      !activatedSite.startsWith('quantity_') &&
+                      activatedSite !== 'N/A' &&
+                      !activatedSite.startsWith('KEY-')) {
+                    allLicensesMap[activatedSite] = {
+                      license_key: license.license_key,
+                      status: license.status || 'active',
+                      created_at: license.created_at,
+                      billing_period: license.billing_period || null,
+                      renewal_date: license.renewal_date || null,
+                      purchase_type: 'quantity',
+                      used_site_domain: license.used_site_domain
+                    };
+                  }
+                }
+                
+                // For quantity purchases: map by subscription_id and item_id (for unactivated licenses)
+                if (license.purchase_type === 'quantity' && license.license_key && license.subscription_id) {
+                  if (!quantityLicensesMap[license.subscription_id]) {
+                    quantityLicensesMap[license.subscription_id] = {};
+                  }
+                  // Map by item_id if available, otherwise use subscription_id as key
+                  const key = license.item_id || license.subscription_id;
+                  quantityLicensesMap[license.subscription_id][key] = {
+                    license_key: license.license_key,
+                    status: license.status || 'active',
+                    created_at: license.created_at,
+                    item_id: license.item_id,
+                    purchase_type: 'quantity',
+                    billing_period: license.billing_period || null,
+                    renewal_date: license.renewal_date || null,
+                    used_site_domain: license.used_site_domain || null
+                  };
+                }
+              }
+            }
+            
+            // Process subscription items
             if (itemsRes && itemsRes.results) {
               
               // Build a map of subscription_id -> items
@@ -6753,17 +7379,94 @@ export default {
                   // Determine item status - if subscription is cancelled or item is removed, mark as inactive
                   const isSubscriptionCancelled = subscriptions[subId].cancel_at_period_end || subscriptions[subId].status === 'canceled' || subscriptions[subId].status === 'cancelling';
                   
-                  subscriptions[subId].items = items.map(item => ({
-                    item_id: item.item_id,
-                    site: item.site_domain,
-                    price: item.price_id,
-                    quantity: item.quantity || 1,
-                    status: item.status || (item.removed_at || isSubscriptionCancelled ? 'inactive' : 'active'),
-                    created_at: item.created_at,
-                    removed_at: item.removed_at || null
-                  }));
-                  subscriptions[subId].sitesCount = items.length;
+                  // Determine purchase_type for subscription based on items and licenses
+                  let subscriptionPurchaseType = null;
+                  const quantityLicenses = quantityLicensesMap[subId] || {};
+                  
+                  // First, process regular subscription items
+                  subscriptions[subId].items = items.map(item => {
+                    // Check if this is a quantity purchase by looking for license
+                    const quantityLicense = quantityLicenses[item.item_id] || quantityLicenses[subId];
+                    const isQuantityPurchase = !!quantityLicense;
+                    
+                    // Determine purchase_type for this item
+                    // If item has purchase_type in DB, use it; otherwise infer from license
+                    let itemPurchaseType = item.purchase_type;
+                    if (!itemPurchaseType) {
+                      itemPurchaseType = isQuantityPurchase ? 'quantity' : 'site';
+                    }
+                    
+                    // Set subscription purchase_type based on first item (before adding activated licenses)
+                    if (!subscriptionPurchaseType) {
+                      subscriptionPurchaseType = itemPurchaseType;
+                    }
+                    
+                    return {
+                      item_id: item.item_id,
+                      site: item.site_domain,
+                      site_domain: item.site_domain, // Add both for compatibility
+                      price: item.price_id,
+                      quantity: item.quantity || 1,
+                      status: item.status || (item.removed_at || isSubscriptionCancelled ? 'inactive' : 'active'),
+                      created_at: item.created_at,
+                      removed_at: item.removed_at || null,
+                      purchase_type: itemPurchaseType,
+                      license_key: quantityLicense?.license_key || null
+                    };
+                  });
+                  
+                  // CRITICAL: Only add activated license sites to quantity purchase subscriptions
+                  // Site purchase subscriptions should NOT have activated license items added
+                  if (subscriptionPurchaseType === 'quantity') {
+                    const activatedLicenses = (allLicensesResult && allLicensesResult.results) ? allLicensesResult.results.filter(lic => 
+                      lic.subscription_id === subId &&
+                      lic.purchase_type === 'quantity' &&
+                      lic.used_site_domain &&
+                      !lic.used_site_domain.startsWith('license_') &&
+                      !lic.used_site_domain.startsWith('quantity_') &&
+                      lic.used_site_domain !== 'N/A' &&
+                      !lic.used_site_domain.startsWith('KEY-')
+                    ) : [];
+                    
+                    // Add activated license sites as items if they're not already in items
+                    const existingSites = new Set(subscriptions[subId].items.map(i => (i.site || i.site_domain || '').toLowerCase().trim()));
+                    
+                    for (const activatedLicense of activatedLicenses) {
+                      const activatedSite = activatedLicense.used_site_domain.toLowerCase().trim();
+                      if (!existingSites.has(activatedSite)) {
+                        // Find a matching item_id or create a placeholder
+                        let itemId = activatedLicense.item_id || `license_${activatedLicense.license_key?.substring(0, 8)}_${subId.substring(0, 12)}`;
+                        
+                        // Try to find price_id from subscription items or get from first item
+                        let priceId = null;
+                        if (subscriptions[subId].items.length > 0) {
+                          priceId = subscriptions[subId].items[0].price;
+                        }
+                        
+                        subscriptions[subId].items.push({
+                          item_id: itemId,
+                          site: activatedLicense.used_site_domain,
+                          site_domain: activatedLicense.used_site_domain,
+                          price: priceId,
+                          quantity: 1,
+                          status: 'active',
+                          created_at: activatedLicense.created_at || Math.floor(Date.now() / 1000),
+                          removed_at: null,
+                          purchase_type: 'quantity',
+                          license_key: activatedLicense.license_key,
+                          isActivated: true, // Mark as activated license
+                          billing_period: activatedLicense.billing_period || subscriptions[subId].billingPeriod || null,
+                          renewal_date: activatedLicense.renewal_date || subscriptions[subId].current_period_end || null
+                        });
+                        existingSites.add(activatedSite);
+                      }
+                    }
+                  }
+                  
+                  subscriptions[subId].sitesCount = subscriptions[subId].items.length;
                   subscriptions[subId].billingPeriod = billingPeriod;
+                  // CRITICAL: Ensure purchase_type is correctly set - don't let activated licenses change it
+                  subscriptions[subId].purchase_type = subscriptionPurchaseType || 'site'; // Default to 'site' if can't determine
                 }
               }
             }
@@ -6915,18 +7618,46 @@ export default {
                         if (!siteDomain || siteDomain.startsWith('site_')) {
                           siteDomain = `site_${itemsToSave.length + 1}`;
                         }
+                      } else {
+                        // For quantity purchases, use a placeholder since site_domain is required but not applicable
+                        // Use license key or subscription ID as identifier
+                        const licenseKey = quantityLicense?.license_key || '';
+                        if (licenseKey) {
+                          siteDomain = `license_${licenseKey.substring(0, 8)}_${subId.substring(0, 12)}`;
+                        } else {
+                          siteDomain = `quantity_${subId.substring(0, 20)}`;
+                        }
+                      }
+                      
+                      // Determine purchase type - check if this is an activated license
+                      let itemPurchaseType = isQuantityPurchase ? 'quantity' : 'site';
+                      let isActivated = false;
+                      
+                      if (isQuantityPurchase && quantityLicense && quantityLicense.used_site_domain) {
+                        // This is an activated license - use the actual site domain
+                        const actualSite = quantityLicense.used_site_domain;
+                        if (actualSite && 
+                            !actualSite.startsWith('license_') && 
+                            !actualSite.startsWith('quantity_') &&
+                            actualSite !== 'N/A' &&
+                            !actualSite.startsWith('KEY-')) {
+                          siteDomain = actualSite; // Use the activated site domain
+                          isActivated = true;
+                        }
                       }
                       
                       itemsToSave.push({
                         item_id: item.id,
                         site: siteDomain,
+                        site_domain: siteDomain, // Add both for compatibility
                         price: item.price.id,
                         quantity: item.quantity || 1,
                         status: 'active',
                         created_at: Math.floor(Date.now() / 1000),
                         // Add license key for quantity purchases
                         license_key: quantityLicense ? quantityLicense.license_key : null,
-                        purchase_type: isQuantityPurchase ? 'quantity' : 'site'
+                        purchase_type: itemPurchaseType,
+                        isActivated: isActivated // Mark activated licenses
                       });
                       
                       // Save to subscription_items table
@@ -6966,59 +7697,26 @@ export default {
           }
         }
         
-        // Step 4: Get all licenses for these subscriptions
-        // For site purchases: map by site_domain
-        // For quantity purchases: map by subscription_id and item_id
-        const allLicensesMap = {}; // site_domain -> license
-        const quantityLicensesMap = {}; // subscription_id -> { item_id -> license }
-        if (subscriptionIds.length > 0) {
-          try {
-            const placeholders = subscriptionIds.map(() => '?').join(',');
-            const licensesRes = await env.DB.prepare(
-              `SELECT license_key, site_domain, subscription_id, item_id, status, purchase_type, created_at 
-               FROM licenses 
-               WHERE subscription_id IN (${placeholders}) AND status = ?`
-            ).bind(...subscriptionIds, 'active').all();
-            
-            if (licensesRes && licensesRes.results) {
-              for (const license of licensesRes.results) {
-                // For site purchases: map by site_domain
-                if (license.site_domain && license.license_key && license.purchase_type !== 'quantity') {
-                  allLicensesMap[license.site_domain] = {
-                    license_key: license.license_key,
-                    status: license.status || 'active',
-                    created_at: license.created_at
-                  };
-                }
-                
-                // For quantity purchases: map by subscription_id and item_id
-                if (license.purchase_type === 'quantity' && license.license_key && license.subscription_id) {
-                  if (!quantityLicensesMap[license.subscription_id]) {
-                    quantityLicensesMap[license.subscription_id] = {};
-                  }
-                  // Map by item_id if available, otherwise use subscription_id as key
-                  const key = license.item_id || license.subscription_id;
-                  quantityLicensesMap[license.subscription_id][key] = {
-                    license_key: license.license_key,
-                    status: license.status || 'active',
-                    created_at: license.created_at,
-                    item_id: license.item_id,
-                    purchase_type: 'quantity'
-                  };
-                }
-              }
-            }
-          } catch (dbErr) {
-            console.error('Error fetching licenses:', dbErr);
-          }
-        }
+        // Step 4: (Licenses are now fetched in Step 3.5, so this step is no longer needed)
+        // License maps are already populated before Step 3 uses them
         
         // Step 5: Build sites object from subscription items
+        // CRITICAL: ONLY include site purchases (purchase_type === 'site') for Domain-Subscriptions
+        // Exclude: direct payments and activated license sites
+        console.log(`[USE CASE 2 - DASHBOARD] 🔍 STEP 4: Building sites object from subscription items`);
+        console.log(`[USE CASE 2 - DASHBOARD] 📊 Processing ${Object.keys(subscriptions).length} subscription(s)`);
+        let useCase2SiteCount = 0;
         for (const [subId, subscription] of Object.entries(subscriptions)) {
           const customerId = subscription.customerId;
           
           for (const item of subscription.items) {
-            const siteDomain = item.site;
+            const siteDomain = item.site || item.site_domain;
+            const itemPurchaseType = item.purchase_type || subscription.purchase_type || 'site';
+            
+            // Only log Use Case 2 items
+            if (itemPurchaseType === 'site') {
+              console.log(`[USE CASE 2 - DASHBOARD] 🔍 Processing site: ${siteDomain} (subscription: ${subId})`);
+            }
             
             // Skip if no site domain
             if (!siteDomain || siteDomain.trim() === '') {
@@ -7026,39 +7724,149 @@ export default {
             }
             
             // Skip placeholder sites (site_1, site_2, etc.) - only show real domains
-            if (siteDomain.startsWith('site_') && /^site_\d+$/.test(siteDomain)) {
+            // BUT include activated license sites even if they have license_ prefix in item
+            const isActivatedLicense = item.isActivated || (item.purchase_type === 'quantity' && item.license_key);
+            if (siteDomain.startsWith('site_') && /^site_\d+$/.test(siteDomain) && !isActivatedLicense) {
               continue;
             }
             
+            // Skip license_ and quantity_ placeholders for unactivated licenses
+            if ((siteDomain.startsWith('license_') || siteDomain.startsWith('quantity_')) && !isActivatedLicense) {
+              continue;
+            }
+            
+            // For activated licenses, use the used_site_domain from license
+            let actualSiteDomain = siteDomain;
+            if (isActivatedLicense && item.purchase_type === 'quantity') {
+              // Try to get the actual site domain from license
+              const license = allLicensesMap[siteDomain] || 
+                            (allLicensesResult && allLicensesResult.results ? allLicensesResult.results.find(lic => 
+                              lic.subscription_id === subId && 
+                              lic.license_key === item.license_key &&
+                              lic.used_site_domain
+                            ) : null);
+              if (license && license.used_site_domain) {
+                actualSiteDomain = license.used_site_domain;
+              } else {
+                // Skip if no actual site domain for activated license
+                continue;
+              }
+            }
+            
+            // CRITICAL: Include ALL sites in sites object (for "Your Domains/Sites" section)
+            // This includes: direct payments, site purchases, and activated license sites
+            // The frontend will filter Domain-Subscriptions to only show site purchases
+            
             // Get license for this site
-            const license = allLicensesMap[siteDomain] || null;
+            const license = allLicensesMap[actualSiteDomain] || 
+                          (item.license_key ? {
+                            license_key: item.license_key,
+                            status: 'active',
+                            purchase_type: item.purchase_type || 'site'
+                          } : null);
             
             // Get site details from sites table
             let siteDetails = null;
             try {
               siteDetails = await env.DB.prepare(
-                'SELECT amount_paid, currency, status, current_period_start, current_period_end, renewal_date, cancel_at_period_end, canceled_at FROM sites WHERE customer_id = ? AND subscription_id = ? AND site_domain = ? LIMIT 1'
-              ).bind(customerId, subId, siteDomain).first();
+                'SELECT amount_paid, currency, status, current_period_start, current_period_end, renewal_date, cancel_at_period_end, canceled_at, billing_period FROM sites WHERE customer_id = ? AND subscription_id = ? AND site_domain = ? LIMIT 1'
+              ).bind(customerId, subId, actualSiteDomain).first();
             } catch (dbErr) {
             }
             
+            // Determine purchase type
+            const purchaseType = item.purchase_type || 
+                               subscription.purchase_type || 
+                               license?.purchase_type || 
+                               'site';
+            
             // Build site object
-            sites[siteDomain] = {
+            sites[actualSiteDomain] = {
               item_id: item.item_id,
               price: item.price,
               quantity: item.quantity || 1,
               status: item.status || 'active',
               created_at: item.created_at,
               subscription_id: subId,
-              license: license,
+              license_key: license?.license_key || item.license_key || null,
+              purchase_type: purchaseType,
+              billing_period: siteDetails?.billing_period || subscription.billingPeriod || license?.billing_period || null,
               amount_paid: siteDetails?.amount_paid || null,
               currency: siteDetails?.currency || 'usd',
               current_period_start: siteDetails?.current_period_start || subscription.current_period_start || null,
               current_period_end: siteDetails?.current_period_end || subscription.current_period_end || null,
-              renewal_date: siteDetails?.renewal_date || subscription.current_period_end || null,
+              renewal_date: siteDetails?.renewal_date || license?.renewal_date || subscription.current_period_end || null,
               cancel_at_period_end: siteDetails?.cancel_at_period_end === 1 || subscription.cancel_at_period_end || false,
               canceled_at: siteDetails?.canceled_at || subscription.canceled_at || null
             };
+            
+            // Log Use Case 2 sites
+            if (purchaseType === 'site') {
+              useCase2SiteCount++;
+              console.log(`[USE CASE 2 - DASHBOARD] ✅ Added site: ${actualSiteDomain} (license: ${sites[actualSiteDomain].license_key?.substring(0, 20)}...)`);
+            }
+          }
+        }
+        console.log(`[USE CASE 2 - DASHBOARD] ✅ STEP 4 COMPLETE: Added ${useCase2SiteCount} Use Case 2 site(s) to sites object`);
+        
+        // Step 5.5: Also add activated license sites that might not be in subscription items
+        // This ensures all activated license sites are included in the sites object
+        // (for "Your Domains/Sites" section which shows all sites)
+        if (allLicensesResult && allLicensesResult.results) {
+          for (const license of allLicensesResult.results) {
+            // Only process activated quantity purchase licenses
+            if (license.purchase_type === 'quantity' && 
+                license.used_site_domain &&
+                !license.used_site_domain.startsWith('license_') &&
+                !license.used_site_domain.startsWith('quantity_') &&
+                license.used_site_domain !== 'N/A' &&
+                !license.used_site_domain.startsWith('KEY-')) {
+              
+              const activatedSite = license.used_site_domain;
+              
+              // Skip if already in sites object
+              if (sites[activatedSite]) {
+                continue;
+              }
+              
+              // Get subscription for this license
+              const subId = license.subscription_id;
+              const subscription = subscriptions[subId];
+              
+              if (subscription) {
+                const customerId = subscription.customerId;
+                
+                // Get site details from sites table
+                let siteDetails = null;
+                try {
+                  siteDetails = await env.DB.prepare(
+                    'SELECT amount_paid, currency, status, current_period_start, current_period_end, renewal_date, cancel_at_period_end, canceled_at, billing_period FROM sites WHERE customer_id = ? AND subscription_id = ? AND site_domain = ? LIMIT 1'
+                  ).bind(customerId, subId, activatedSite).first();
+                } catch (dbErr) {
+                }
+                
+                // Add activated license site to sites object
+                sites[activatedSite] = {
+                  item_id: license.item_id || `license_${license.license_key?.substring(0, 8)}_${subId.substring(0, 12)}`,
+                  price: null, // Will be set from subscription if available
+                  quantity: 1,
+                  status: license.status || 'active',
+                  created_at: license.created_at || Math.floor(Date.now() / 1000),
+                  subscription_id: subId,
+                  license_key: license.license_key,
+                  purchase_type: 'quantity',
+                  billing_period: license.billing_period || subscription.billingPeriod || siteDetails?.billing_period || null,
+                  amount_paid: siteDetails?.amount_paid || null,
+                  currency: siteDetails?.currency || 'usd',
+                  current_period_start: siteDetails?.current_period_start || subscription.current_period_start || null,
+                  current_period_end: siteDetails?.current_period_end || subscription.current_period_end || null,
+                  renewal_date: license.renewal_date || siteDetails?.renewal_date || subscription.current_period_end || null,
+                  cancel_at_period_end: siteDetails?.cancel_at_period_end === 1 || subscription.cancel_at_period_end || false,
+                  canceled_at: siteDetails?.canceled_at || subscription.canceled_at || null,
+                  isActivated: true
+                };
+              }
+            }
           }
         }
         
@@ -7123,483 +7931,21 @@ export default {
         }, true, request);
       }
 
-      // REMOVED: /add-site endpoint - Use /add-sites-batch instead
-      if (false && request.method === 'POST' && pathname === '/add-site') {
-        const body = await request.json();
-        const { site, price, quantity = 1, email: emailParam, subscriptionId: subscriptionIdParam } = body;
-        
-        // Support both session-based and email-based authentication
-        let email = null;
-        let customerId = null;
-        let subscriptionId = subscriptionIdParam || null;
-        
-        // This endpoint is disabled - code removed
-      }
+//USECASE 2 DASHBOARD - END
+if (request.method === 'POST' && url.pathname === '/create-site-checkout') {
+      return handleCreateSiteCheckout(request, env);
+    }
 
-      // REMOVED: /add-site endpoint - Use /add-sites-batch instead
-      if (false && request.method === 'POST' && pathname === '/add-site') {
-        const body = await request.json();
-        const { site, price, quantity = 1, email: emailParam, subscriptionId: subscriptionIdParam } = body;
-        
-        // Support both session-based and email-based authentication
-        let email = null;
-        let customerId = null;
-        let subscriptionId = subscriptionIdParam || null;
-        
-        // This endpoint is disabled - code removed
-      }
+   
 
-      // REMOVED: /add-site endpoint - Use /add-sites-batch instead
-      if (false && request.method === 'POST' && pathname === '/add-site') {
-        const body = await request.json();
-        const { site, price, quantity = 1, email: emailParam, subscriptionId: subscriptionIdParam } = body;
-        
-        // Support both session-based and email-based authentication
-        let email = null;
-        let customerId = null;
-        let subscriptionId = subscriptionIdParam || null;
-        
-        // This endpoint is disabled - code removed
-      }
+   
+    //   if (request.method === 'POST' && url.pathname === '/add-sites-batch') {
+    //   return handleAddSitesBatch(request, env);
+    // }
 
-      // REMOVED: /add-site endpoint - Use /add-sites-batch instead
-      if (false && request.method === 'POST' && pathname === '/add-site') {
-        const body = await request.json();
-        const { site, price, quantity = 1, email: emailParam, subscriptionId: subscriptionIdParam } = body;
-        
-        // Support both session-based and email-based authentication
-        let email = null;
-        let customerId = null;
-        let subscriptionId = subscriptionIdParam || null;
-        
-        // This endpoint is disabled - code removed
-      }
-
-      // REMOVED: /add-site endpoint - Use /add-sites-batch instead
-      if (false && request.method === 'POST' && pathname === '/add-site') {
-        const body = await request.json();
-        const { site, price, quantity = 1, email: emailParam, subscriptionId: subscriptionIdParam } = body;
-        
-        // Support both session-based and email-based authentication
-        let email = null;
-        let customerId = null;
-        let subscriptionId = subscriptionIdParam || null;
-        
-        // This endpoint is disabled - code removed
-      }
-
-      // REMOVED: /add-site endpoint - Use /add-sites-batch instead
-      if (false && request.method === 'POST' && pathname === '/add-site') {
-        const body = await request.json();
-        const { site, price, quantity = 1, email: emailParam, subscriptionId: subscriptionIdParam } = body;
-        
-        // Support both session-based and email-based authentication
-        let email = null;
-        let customerId = null;
-        let subscriptionId = subscriptionIdParam || null;
-        
-        // Try email parameter first (for Memberstack authentication)
-        if (emailParam) {
-          email = emailParam.toLowerCase().trim();
-        } else {
-          // Fallback to session cookie
-        const cookie = request.headers.get('cookie') || '';
-        const match = cookie.match(/sb_session=([^;]+)/);
-          if (!match) return jsonResponse(401, { error: 'unauthenticated', message: 'No email or session provided' }, true, request);
-        const token = match[1];
-        const payload = await verifyToken(env, token);
-          if (!payload) return jsonResponse(401, { error: 'invalid session' }, true, request);
-          email = payload.email;
-          customerId = payload.customerId;
-        }
-        
-        if (!email || !email.includes('@')) {
-          return jsonResponse(400, { error: 'invalid email', message: 'Valid email is required' }, true, request);
-        }
-        
-        if (!site) return jsonResponse(400, { error: 'missing site' }, true, request);
-
-        // Get user by email (email-based structure)
-        let userFromEmail = await getUserByEmail(env, email);
-        let user = null; // Will be set in either branch
-        
-        // If email-based structure exists, use it
-        if (userFromEmail && userFromEmail.customers && userFromEmail.customers.length > 0) {
-          // Get the first customer (or find by customerId if provided)
-          const customer = customerId 
-            ? userFromEmail.customers.find(c => c.customerId === customerId)
-            : userFromEmail.customers[0];
-          
-          if (!customer) {
-            return jsonResponse(400, { error: 'customer not found', message: 'No customer found for this email' }, true, request);
-          }
-          
-          customerId = customer.customerId;
-          
-          // Get subscription (use provided subscriptionId or first active subscription)
-          const subscription = subscriptionId
-            ? customer.subscriptions.find(s => s.subscriptionId === subscriptionId)
-            : customer.subscriptions.find(s => s.status === 'active') || customer.subscriptions[0];
-          
-          if (subscription) {
-            subscriptionId = subscription.subscriptionId;
-          }
-          
-          // Convert email-based structure to legacy format for compatibility
-          user = {
-            customerId: customerId,
-            email: email,
-          sites: {},
-            pendingSites: userFromEmail.pendingSites || [],
-            subscriptionId: subscriptionId,
-            defaultPrice: userFromEmail.defaultPrice || null
-          };
-          
-          // Convert items to sites format
-          customer.subscriptions.forEach(sub => {
-            if (sub.items) {
-              sub.items.forEach(item => {
-                if (item.site) {
-                  user.sites[item.site] = {
-                    item_id: item.item_id,
-                    price: item.price,
-                    quantity: item.quantity || 1,
-                    status: item.status || 'active',
-                    created_at: item.created_at,
-                    subscription_id: sub.subscriptionId
-                  };
-                }
-              });
-            }
-          });
-          
-          // Continue with existing logic using converted user object
-          // (rest of the function remains the same)
-        } else {
-          // Fallback to legacy customer-based structure
-          if (!customerId) {
-            // Try to find customer ID from payments table
-            if (env.DB) {
-              try {
-                const paymentResult = await env.DB.prepare(
-                  'SELECT customer_id FROM payments WHERE email = ? ORDER BY created_at DESC LIMIT 1'
-                ).bind(email).first();
-                if (paymentResult && paymentResult.customer_id) {
-                  customerId = paymentResult.customer_id;
-                }
-              } catch (dbError) {
-                console.error('[add-site] Error fetching customer ID from payments:', dbError);
-              }
-            }
-            
-            if (!customerId) {
-              return jsonResponse(400, { error: 'customer not found', message: 'No customer found for this email. Please complete a payment first.' }, true, request);
-            }
-          }
-          
-          // Get user from database by customerId
-          user = await getUserByCustomerId(env, customerId);
-          
-          // If user doesn't exist yet, create a new user structure
-          if (!user) {
-            user = {
-              email: email,
-              customers: [{
-                customerId: customerId,
-                subscriptions: [],
-                created_at: Math.floor(Date.now() / 1000)
-              }],
-              licenses: [],
-              pendingSites: [],
-              created_at: Math.floor(Date.now() / 1000),
-              updated_at: Math.floor(Date.now() / 1000)
-            };
-          }
-        }
-
-        // Check if site already exists (active or pending)
-        if (user.sites && user.sites[site] && user.sites[site].status === 'active') {
-          return jsonResponse(400, { error: 'site already exists' }, true, request);
-        }
-        if (user.pendingSites && user.pendingSites.some(s => s.site === site)) {
-          return jsonResponse(400, { error: 'site already in pending list' }, true, request);
-        }
-        
-        // If site exists but is inactive, remove it first (clean up old data)
-        if (user.sites && user.sites[site] && user.sites[site].status === 'inactive') {
-          // Remove the old inactive site entry - we'll create a fresh one
-          delete user.sites[site];
-        }
-
-        // ALWAYS add to pending sites first - payment required before adding to subscription
-        // This ensures users pay for new sites before they're added to their subscription
-        if (!user.pendingSites) user.pendingSites = [];
-        
-        // Determine price to use for pending sites
-        let priceToUse = price;
-        if (!priceToUse) {
-          // Try to get price from existing site
-          if (user.sites && Object.keys(user.sites).length > 0) {
-            const firstSite = Object.values(user.sites).find(s => s.status === 'active');
-            if (firstSite && firstSite.price) {
-              priceToUse = firstSite.price;
-            }
-          }
-          // Try user's default price (stored after first payment)
-          if (!priceToUse && user.defaultPrice) {
-            priceToUse = user.defaultPrice;
-          }
-          // Fallback to environment variable
-          if (!priceToUse && env.DEFAULT_PRICE_ID) {
-            priceToUse = env.DEFAULT_PRICE_ID;
-          }
-          if (!priceToUse) {
-            return jsonResponse(400, { 
-              error: 'price required', 
-              message: 'Please provide a Price ID for new sites, or configure DEFAULT_PRICE_ID in wrangler.jsonc.' 
-            }, true, request);
-          }
-        }
-
-        // Add site to pending list
-        user.pendingSites.push({
-          site: site,
-          price: priceToUse,
-          quantity: quantity || 1
-        });
-
-        // Save to both structures if using email-based
-        if (userFromEmail && userFromEmail.customers && userFromEmail.customers.length > 0) {
-          // Update email-based structure
-          userFromEmail.pendingSites = user.pendingSites;
-          await saveUserByEmail(env, email, userFromEmail);
-        } else {
-          // Save to legacy structure
-          const userKey = `user:${customerId}`;
-          await saveUserByEmail(env, email, user);
-        }
-
-
-        return jsonResponse(200, { 
-          success: true, 
-          site: site,
-          pending: true,
-          message: 'Site added to cart. Click "Pay Now" to checkout and complete payment.'
-        }, true, request);
-      }
-
-      // Batch add multiple sites to pending list (prevents race conditions)
-      if (request.method === 'POST' && pathname === '/add-sites-batch') {
-        const body = await request.json();
-        const { sites, email: emailParam, subscriptionId: subscriptionIdParam } = body;
-        
-        // Support both session-based and email-based authentication
-        let email = null;
-        let customerId = null;
-        let subscriptionId = subscriptionIdParam || null;
-        
-        // Try email parameter first (for Memberstack authentication)
-        if (emailParam) {
-          email = emailParam.toLowerCase().trim();
-        } else {
-          // Fallback to session cookie
-        const cookie = request.headers.get('cookie') || '';
-        const match = cookie.match(/sb_session=([^;]+)/);
-          if (!match) return jsonResponse(401, { error: 'unauthenticated', message: 'No email or session provided' }, true, request);
-        const token = match[1];
-        const payload = await verifyToken(env, token);
-          if (!payload) return jsonResponse(401, { error: 'invalid session' }, true, request);
-          email = payload.email;
-          customerId = payload.customerId;
-        }
-
-        if (!email || !email.includes('@')) {
-          return jsonResponse(400, { error: 'invalid email', message: 'Valid email is required' }, true, request);
-        }
-        
-        if (!Array.isArray(sites) || sites.length === 0) {
-          return jsonResponse(400, { error: 'sites array required' }, true, request);
-        }
-        
-
-        // Get user by email (email-based structure)
-        let userFromEmail = await getUserByEmail(env, email);
-        let user = null;
-        
-        // If email-based structure exists, use it
-        if (userFromEmail && userFromEmail.customers && userFromEmail.customers.length > 0) {
-          // Get the first customer (or find by customerId if provided)
-          const customer = customerId 
-            ? userFromEmail.customers.find(c => c.customerId === customerId)
-            : userFromEmail.customers[0];
-          
-          if (!customer) {
-            return jsonResponse(400, { error: 'customer not found', message: 'No customer found for this email' }, true, request);
-          }
-          
-          customerId = customer.customerId;
-          
-          // Get subscription (use provided subscriptionId or first active subscription)
-          const subscription = subscriptionId
-            ? customer.subscriptions.find(s => s.subscriptionId === subscriptionId)
-            : customer.subscriptions.find(s => s.status === 'active') || customer.subscriptions[0];
-          
-          if (subscription) {
-            subscriptionId = subscription.subscriptionId;
-          }
-          
-          // Convert email-based structure to legacy format for compatibility
-          user = {
-            customerId: customerId,
-            email: email,
-          sites: {},
-            pendingSites: userFromEmail.pendingSites || [],
-            subscriptionId: subscriptionId,
-            defaultPrice: userFromEmail.defaultPrice || null
-          };
-          
-          // Convert items to sites format
-          customer.subscriptions.forEach(sub => {
-            if (sub.items) {
-              sub.items.forEach(item => {
-                if (item.site) {
-                  user.sites[item.site] = {
-                    item_id: item.item_id,
-                    price: item.price,
-                    quantity: item.quantity || 1,
-                    status: item.status || 'active',
-                    created_at: item.created_at,
-                    subscription_id: sub.subscriptionId
-                  };
-                }
-              });
-            }
-          });
-        } else {
-          // Fallback to legacy customer-based structure
-          if (!customerId) {
-            // Try to find customer ID from payments table
-            if (env.DB) {
-              try {
-                const paymentResult = await env.DB.prepare(
-                  'SELECT customer_id FROM payments WHERE email = ? ORDER BY created_at DESC LIMIT 1'
-                ).bind(email).first();
-                if (paymentResult && paymentResult.customer_id) {
-                  customerId = paymentResult.customer_id;
-                }
-              } catch (dbError) {
-                console.error('[add-sites-batch] Error fetching customer ID from payments:', dbError);
-              }
-            }
-            
-            if (!customerId) {
-              return jsonResponse(400, { error: 'customer not found', message: 'No customer found for this email. Please complete a payment first.' }, true, request);
-            }
-          }
-          
-          // Get user from database by customerId
-          user = await getUserByCustomerId(env, customerId);
-          
-          // If user doesn't exist yet, create a new user structure
-          if (!user) {
-            user = {
-              email: email,
-              customers: [{
-                customerId: customerId,
-                subscriptions: [],
-                created_at: Math.floor(Date.now() / 1000)
-              }],
-              licenses: [],
-              pendingSites: [],
-              created_at: Math.floor(Date.now() / 1000),
-              updated_at: Math.floor(Date.now() / 1000)
-            };
-          }
-        }
-
-        if (!user.pendingSites) user.pendingSites = [];
-
-        // Determine price to use (same logic as single add-site)
-        let priceToUse = null;
-        if (user.sites && Object.keys(user.sites).length > 0) {
-          const firstSite = Object.values(user.sites).find(s => s.status === 'active');
-          if (firstSite && firstSite.price) {
-            priceToUse = firstSite.price;
-          }
-        }
-        if (!priceToUse && user.defaultPrice) {
-          priceToUse = user.defaultPrice;
-        }
-        if (!priceToUse && env.DEFAULT_PRICE_ID) {
-          priceToUse = env.DEFAULT_PRICE_ID;
-        }
-        if (!priceToUse) {
-          return jsonResponse(400, { 
-            error: 'price required', 
-            message: 'Please configure DEFAULT_PRICE_ID in wrangler.jsonc.' 
-          }, true, request);
-        }
-
-        // Add all sites in one atomic operation
-        const addedSites = [];
-        const errors = [];
-
-        for (const site of sites) {
-          const siteStr = site.trim();
-          if (!siteStr) {
-            continue;
-          }
-          
-
-          // Check if site already exists
-          if (user.sites && user.sites[siteStr] && user.sites[siteStr].status === 'active') {
-            errors.push(`${siteStr}: already exists`);
-            continue;
-          }
-          
-          const alreadyPending = user.pendingSites.some(s => {
-            const pendingSite = s.site || s;
-            return pendingSite.toLowerCase().trim() === siteStr.toLowerCase().trim();
-          });
-          
-          if (alreadyPending) {
-            errors.push(`${siteStr}: already in pending list`);
-            continue;
-          }
-
-          // Remove if inactive
-          if (user.sites && user.sites[siteStr] && user.sites[siteStr].status === 'inactive') {
-            delete user.sites[siteStr];
-          }
-
-          // Add to pending list
-          user.pendingSites.push({
-            site: siteStr,
-            price: priceToUse,
-            quantity: 1
-          });
-          addedSites.push(siteStr);
-        }
-
-        // Save to both structures if using email-based
-        if (userFromEmail && userFromEmail.customers && userFromEmail.customers.length > 0) {
-          // Update email-based structure
-          userFromEmail.pendingSites = user.pendingSites;
-          await saveUserByEmail(env, email, userFromEmail);
-        } else {
-          // Save to database (all data is in D1, not KV)
-          await saveUserByEmail(env, email, user);
-        }
-
-
-        return jsonResponse(200, { 
-          success: true, 
-          added: addedSites,
-          errors: errors,
-          message: `Added ${addedSites.length} site(s) to cart. Click "Pay Now" to checkout.`
-        }, true, request);
-      }
-
+    // if (request.method === 'POST' && url.pathname === '/create-checkout-from-pending') {
+    //   return handleCreateCheckoutFromPending(request, env);
+    // }
       // Get magic link for a customer (for testing/display after payment)
       // Supports: ?email=... OR ?session_id=... OR ?customer_id=...
       if (request.method === 'GET' && pathname === '/get-magic-link') {
@@ -7704,10 +8050,197 @@ export default {
       }
 
       // Get licenses for a customer
+      // Get available price options (monthly/yearly) from database
+      if (request.method === 'GET' && pathname === '/get-price-options') {
+        try {
+          // Try to get from database first
+          if (env.DB) {
+            const monthlyResult = await env.DB.prepare(
+              'SELECT price_id, discount_allowance, discount_type, coupon_code FROM price_config WHERE price_type = ? AND is_active = 1'
+            ).bind('monthly').first();
+            
+            const yearlyResult = await env.DB.prepare(
+              'SELECT price_id, discount_allowance, discount_type, coupon_code FROM price_config WHERE price_type = ? AND is_active = 1'
+            ).bind('yearly').first();
+            
+            if (monthlyResult || yearlyResult) {
+              return jsonResponse(200, {
+                monthly: monthlyResult ? {
+                  price_id: monthlyResult.price_id,
+                  discount_allowance: monthlyResult.discount_allowance || 0,
+                  discount_type: monthlyResult.discount_type || 'percentage',
+                  coupon_code: monthlyResult.coupon_code || null
+                } : null,
+                yearly: yearlyResult ? {
+                  price_id: yearlyResult.price_id,
+                  discount_allowance: yearlyResult.discount_allowance || 0,
+                  discount_type: yearlyResult.discount_type || 'percentage',
+                  coupon_code: yearlyResult.coupon_code || null
+                } : null,
+                source: 'database'
+              }, true, request);
+            }
+          }
+          
+          // Fallback to environment variables if database not available
+          return jsonResponse(200, {
+            monthly: env.MONTHLY_PRICE_ID ? {
+              price_id: env.MONTHLY_PRICE_ID,
+              discount_allowance: 0,
+              discount_type: 'percentage',
+              coupon_code: null
+            } : null,
+            yearly: env.YEARLY_PRICE_ID ? {
+              price_id: env.YEARLY_PRICE_ID,
+              discount_allowance: 0,
+              discount_type: 'percentage',
+              coupon_code: null
+            } : null,
+            default: env.DEFAULT_PRICE_ID || null,
+            source: 'environment'
+          }, true, request);
+        } catch (error) {
+          console.error('[get-price-options] Error:', error);
+          // Fallback to environment variables on error
+          return jsonResponse(200, {
+            monthly: env.MONTHLY_PRICE_ID ? {
+              price_id: env.MONTHLY_PRICE_ID,
+              discount_allowance: 0,
+              discount_type: 'percentage',
+              coupon_code: null
+            } : null,
+            yearly: env.YEARLY_PRICE_ID ? {
+              price_id: env.YEARLY_PRICE_ID,
+              discount_allowance: 0,
+              discount_type: 'percentage',
+              coupon_code: null
+            } : null,
+            default: env.DEFAULT_PRICE_ID || null,
+            source: 'environment_fallback',
+            error: error.message
+          }, true, request);
+        }
+      }
+
+      // Admin endpoint to update price configuration
+      if (request.method === 'POST' && pathname === '/admin/update-price-config') {
+        try {
+          const body = await request.json();
+          const { price_type, price_id, discount_allowance, discount_type, coupon_code, description, is_active } = body;
+          
+          // Validate required fields
+          if (!price_type || !price_id) {
+            return jsonResponse(400, {
+              error: 'missing_fields',
+              message: 'price_type and price_id are required'
+            }, true, request);
+          }
+          
+          if (price_type !== 'monthly' && price_type !== 'yearly') {
+            return jsonResponse(400, {
+              error: 'invalid_price_type',
+              message: 'price_type must be "monthly" or "yearly"'
+            }, true, request);
+          }
+          
+          if (!env.DB) {
+            return jsonResponse(500, {
+              error: 'database_not_available',
+              message: 'Database is not configured'
+            }, true, request);
+          }
+          
+          // Update or insert price config
+          const discountAllowance = discount_allowance !== undefined ? discount_allowance : 0;
+          const discountType = discount_type || 'percentage';
+          const couponCode = coupon_code || null;
+          const isActive = is_active !== undefined ? (is_active ? 1 : 0) : 1;
+          const desc = description || null;
+          
+          // Check if record exists
+          const existing = await env.DB.prepare(
+            'SELECT id FROM price_config WHERE price_type = ?'
+          ).bind(price_type).first();
+          
+          if (existing) {
+            // Update existing record
+            await env.DB.prepare(`
+              UPDATE price_config 
+              SET price_id = ?,
+                  discount_allowance = ?,
+                  discount_type = ?,
+                  coupon_code = ?,
+                  is_active = ?,
+                  description = ?,
+                  updated_at = unixepoch()
+              WHERE price_type = ?
+            `).bind(price_id, discountAllowance, discountType, couponCode, isActive, desc, price_type).run();
+          } else {
+            // Insert new record
+            await env.DB.prepare(`
+              INSERT INTO price_config (price_type, price_id, discount_allowance, discount_type, coupon_code, is_active, description, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch(), unixepoch())
+            `).bind(price_type, price_id, discountAllowance, discountType, couponCode, isActive, desc).run();
+          }
+          
+          return jsonResponse(200, {
+            success: true,
+            message: `Price config for ${price_type} updated successfully`,
+            data: {
+              price_type,
+              price_id,
+              discount_allowance: discountAllowance,
+              discount_type: discountType,
+              coupon_code: couponCode,
+              is_active: isActive,
+              description: desc
+            }
+          }, true, request);
+        } catch (error) {
+          console.error('[admin/update-price-config] Error:', error);
+          return jsonResponse(500, {
+            error: 'update_failed',
+            message: error.message || 'Failed to update price config'
+          }, true, request);
+        }
+      }
+
+      // Admin endpoint to get all price configurations
+      if (request.method === 'GET' && pathname === '/admin/price-config') {
+        try {
+          if (!env.DB) {
+            return jsonResponse(500, {
+              error: 'database_not_available',
+              message: 'Database is not configured'
+            }, true, request);
+          }
+          
+          const results = await env.DB.prepare(
+            'SELECT * FROM price_config ORDER BY price_type'
+          ).all();
+          
+          return jsonResponse(200, {
+            success: true,
+            data: results.results || []
+          }, true, request);
+        } catch (error) {
+          console.error('[admin/price-config] Error:', error);
+          return jsonResponse(500, {
+            error: 'fetch_failed',
+            message: error.message || 'Failed to fetch price config'
+          }, true, request);
+        }
+      }
+
       if (request.method === 'GET' && pathname === '/licenses') {
         
         // Try to get email from query parameter (for Memberstack users)
         const emailParam = url.searchParams.get('email');
+        
+        // Pagination parameters
+        const limit = parseInt(url.searchParams.get('limit')) || 10;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+        const status = url.searchParams.get('status'); // 'available', 'activated', 'cancelling', 'cancelled'
         
         const cookie = request.headers.get('cookie') || '';
         const match = cookie.match(/sb_session=([^;]+)/);
@@ -7722,12 +8255,12 @@ export default {
         const token = match[1];
           payload = await verifyToken(env, token);
         if (!payload) {
-            return jsonResponse(401, { error: 'invalid session', message: 'Session token is invalid or expired', licenses: [] }, true, request);
+            return jsonResponse(401, { error: 'invalid session', message: 'Session token is invalid or expired', licenses: [], pagination: { total: 0, hasMore: false } }, true, request);
           }
           email = payload.email;
           customerId = payload.customerId;
         } else {
-          return jsonResponse(401, { error: 'unauthenticated', message: 'No session cookie found', licenses: [] }, true, request);
+          return jsonResponse(401, { error: 'unauthenticated', message: 'No session cookie found', licenses: [], pagination: { total: 0, hasMore: false } }, true, request);
         }
 
         // CRITICAL: Find ALL customers with the same email to get all licenses
@@ -7781,14 +8314,14 @@ export default {
               // IMPORTANT: Query ALL licenses (not just active) to show complete history
               try {
                 result = await env.DB.prepare(
-                  `SELECT license_key, site_domain, used_site_domain, status, purchase_type, created_at, customer_id, subscription_id, item_id FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
+                  `SELECT license_key, site_domain, used_site_domain, status, purchase_type, created_at, customer_id, subscription_id, item_id, billing_period, renewal_date FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
                 ).bind(...allCustomerIds).all();
               } catch (columnErr) {
                 // Fallback if new columns don't exist yet
                 if (columnErr.message && (columnErr.message.includes('no such column: used_site_domain') || columnErr.message.includes('no such column: purchase_type'))) {
                   try {
                     result = await env.DB.prepare(
-                      `SELECT license_key, site_domain, status, created_at, customer_id, subscription_id FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
+                      `SELECT license_key, site_domain, status, created_at, customer_id, subscription_id, item_id, purchase_type, billing_period, renewal_date FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
                     ).bind(...allCustomerIds).all();
                   } catch (fallbackErr) {
                     if (fallbackErr.message && fallbackErr.message.includes('no such column: site_domain')) {
@@ -7858,6 +8391,8 @@ export default {
                     customer_id: row.customer_id || customerId,
                     subscription_id: row.subscription_id || null,
                     item_id: row.item_id || null,
+                    billing_period: row.billing_period || null, // From licenses table
+                    renewal_date: row.renewal_date || subscriptionInfo?.current_period_end || null, // From licenses table or subscription
                     subscription_status: subscriptionInfo?.status || null,
                     subscription_cancelled: isSubscriptionCancelled || false,
                     subscription_cancel_at_period_end: subscriptionInfo?.cancel_at_period_end || false,
@@ -7893,14 +8428,25 @@ export default {
                   try {
                     // Query ALL licenses (not just active) to show complete history
                     licenseRes = await env.DB.prepare(
-                      `SELECT license_key, site_domain, used_site_domain, purchase_type, status, created_at, customer_id, subscription_id, item_id FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
+                      `SELECT license_key, site_domain, used_site_domain, purchase_type, status, created_at, customer_id, subscription_id, item_id, billing_period, renewal_date FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
                     ).bind(...customerIds).all();
                   } catch (colError) {
                     // Fallback if used_site_domain doesn't exist
                     if (colError.message && colError.message.includes('no such column: used_site_domain')) {
-                      licenseRes = await env.DB.prepare(
-                        `SELECT license_key, site_domain, status, created_at, customer_id, subscription_id, item_id FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
-                      ).bind(...customerIds).all();
+                      try {
+                        licenseRes = await env.DB.prepare(
+                          `SELECT license_key, site_domain, status, created_at, customer_id, subscription_id, item_id, purchase_type, billing_period, renewal_date FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
+                        ).bind(...customerIds).all();
+                      } catch (colError2) {
+                        // Fallback if billing_period or renewal_date don't exist
+                        if (colError2.message && (colError2.message.includes('no such column: billing_period') || colError2.message.includes('no such column: renewal_date'))) {
+                          licenseRes = await env.DB.prepare(
+                            `SELECT license_key, site_domain, status, created_at, customer_id, subscription_id, item_id, purchase_type FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
+                          ).bind(...customerIds).all();
+                        } else {
+                          throw colError2;
+                        }
+                      }
                     } else {
                       throw colError;
                     }
@@ -7953,6 +8499,8 @@ export default {
                         customer_id: l.customer_id || customerIds[0],
                         subscription_id: l.subscription_id || null,
                         item_id: l.item_id || null,
+                        billing_period: l.billing_period || null, // From licenses table
+                        renewal_date: l.renewal_date || subscriptionInfo?.current_period_end || null, // From licenses table or subscription
                         subscription_status: subscriptionInfo?.status || null,
                         subscription_cancelled: isSubscriptionCancelled || false,
                         subscription_cancel_at_period_end: subscriptionInfo?.cancel_at_period_end || false,
@@ -8031,8 +8579,10 @@ export default {
 
       // Create checkout session from pending sites - adds to existing subscription or creates new one
       if (request.method === 'POST' && pathname === '/create-checkout-from-pending') {
+        console.log(`[USE CASE 2 - CHECKOUT] 🚀 STEP 2: Starting checkout session creation`);
         const body = await request.json();
-        const { email: emailParam, subscriptionId: subscriptionIdParam } = body;
+        const { email: emailParam, subscriptionId: subscriptionIdParam, billing_period: billingPeriodParam, price_id: priceIdParam } = body;
+        console.log(`[USE CASE 2 - CHECKOUT] 📥 Received request: billing_period: ${billingPeriodParam}, price_id: ${priceIdParam}`);
         
         // Support both session-based and email-based authentication
         let email = null;
@@ -8141,8 +8691,120 @@ export default {
         }
 
         // Check if there are pending sites
+        console.log(`[USE CASE 2 - CHECKOUT] 🔍 STEP 2.1: Checking pending sites (count: ${user.pendingSites?.length || 0})`);
         if (!user.pendingSites || user.pendingSites.length === 0) {
+          console.log(`[USE CASE 2 - CHECKOUT] ❌ No pending sites found`);
           return jsonResponse(400, { error: 'no pending sites to checkout', message: 'Please add sites to the pending list first' }, true, request);
+        }
+        console.log(`[USE CASE 2 - CHECKOUT] ✅ Found ${user.pendingSites.length} pending site(s):`, user.pendingSites.map(ps => ps.site || ps.site_domain));
+
+        // CRITICAL: Check if any pending sites already exist in subscription details
+        const existingSitesSet = new Set();
+        
+        // Check legacy structure (user.sites)
+        if (user.sites) {
+          Object.keys(user.sites).forEach(site => {
+            if (user.sites[site] && user.sites[site].status === 'active') {
+              existingSitesSet.add(site.toLowerCase().trim());
+            }
+          });
+        }
+        
+        // Check email-based structure (subscription items)
+        if (userFromEmail && userFromEmail.customers) {
+          userFromEmail.customers.forEach(customer => {
+            if (customer.subscriptions) {
+              customer.subscriptions.forEach(subscription => {
+                if (subscription.items) {
+                  subscription.items.forEach(item => {
+                    if (item.site && item.status === 'active') {
+                      existingSitesSet.add(item.site.toLowerCase().trim());
+                    }
+                  });
+                }
+              });
+            }
+          });
+        }
+        
+        // CRITICAL: Check database across ALL users to prevent duplicate sites
+        // Check subscription_items, sites, and licenses tables
+        const duplicateSites = [];
+        if (env.DB) {
+          try {
+            // Get all pending site names
+            const pendingSiteNames = user.pendingSites.map(ps => {
+              const siteName = (ps.site || ps.site_domain || '').toLowerCase().trim();
+              return siteName;
+            }).filter(s => s);
+            
+            if (pendingSiteNames.length > 0) {
+              // Check each pending site against all database tables (across all users)
+              for (const pendingSite of pendingSiteNames) {
+                let isDuplicate = false;
+                
+                // Check if site exists in subscription_items (across all users)
+                const existingInItems = await env.DB.prepare(
+                  'SELECT site_domain FROM subscription_items WHERE LOWER(TRIM(site_domain)) = ? AND status = ? LIMIT 1'
+                ).bind(pendingSite, 'active').first();
+                
+                if (existingInItems) {
+                  isDuplicate = true;
+                }
+                
+                // Check if site exists in sites table (across all users)
+                if (!isDuplicate) {
+                  const existingInSites = await env.DB.prepare(
+                    'SELECT site_domain FROM sites WHERE LOWER(TRIM(site_domain)) = ? AND status = ? LIMIT 1'
+                  ).bind(pendingSite, 'active').first();
+                  
+                  if (existingInSites) {
+                    isDuplicate = true;
+                  }
+                }
+                
+                // Check if site exists in licenses table - both site_domain and used_site_domain (across all users)
+                if (!isDuplicate) {
+                  const existingInLicenses = await env.DB.prepare(
+                    'SELECT site_domain, used_site_domain FROM licenses WHERE (LOWER(TRIM(site_domain)) = ? OR LOWER(TRIM(used_site_domain)) = ?) AND (site_domain IS NOT NULL AND site_domain != "" OR used_site_domain IS NOT NULL AND used_site_domain != "") LIMIT 1'
+                  ).bind(pendingSite, pendingSite).first();
+                  
+                  if (existingInLicenses) {
+                    isDuplicate = true;
+                  }
+                }
+                
+                // Also check against existingSitesSet (from user's own subscriptions)
+                if (!isDuplicate && existingSitesSet.has(pendingSite)) {
+                  isDuplicate = true;
+                }
+                
+                if (isDuplicate) {
+                  duplicateSites.push(pendingSite);
+                }
+              }
+            }
+          } catch (dbError) {
+            console.warn('[create-checkout-from-pending] Error checking database for existing sites:', dbError);
+          }
+        } else {
+          // Fallback: check against existingSitesSet if database not available
+          user.pendingSites.forEach(ps => {
+            const siteName = (ps.site || ps.site_domain || '').toLowerCase().trim();
+            if (siteName && existingSitesSet.has(siteName)) {
+              duplicateSites.push(siteName);
+            }
+          });
+        }
+        
+        // If any duplicates found, return error
+        if (duplicateSites.length > 0) {
+          const duplicateList = duplicateSites.join(', ');
+          return jsonResponse(400, { 
+            error: 'duplicate_sites', 
+            message: `The following site(s) already exist and cannot be added (may be in use by another user): ${duplicateList}. Please remove them from the pending list.`,
+            duplicateSites: duplicateSites
+          }, true, request);
         }
 
         // Email and customerId are already set above from authentication
@@ -8203,6 +8865,7 @@ export default {
           
         // USE CASE 2: Create separate subscription for each site (like Use Case 3 for licenses)
         // Use payment mode and handle subscription creation in webhook
+        console.log(`[USE CASE 2 - CHECKOUT] 🔍 STEP 2.2: Preparing checkout session for ${uniquePendingSites.length} site(s)`);
         const form = {
           'customer': customerId,
           'success_url': successUrl,
@@ -8210,15 +8873,24 @@ export default {
           'mode': 'payment', // Payment mode like Use Case 3
         };
 
-        // Get price ID from first pending site (all sites should use same price)
-        const firstSite = uniquePendingSites[0];
-        const priceId = firstSite.price || firstSite.price_id;
+        // Get price ID from billing_period parameter (required - no fallbacks)
+        if (!billingPeriodParam) {
+          console.log(`[USE CASE 2 - CHECKOUT] ❌ Missing billing_period parameter`);
+          return jsonResponse(400, { 
+            error: 'missing_billing_period', 
+            message: 'billing_period parameter is required (monthly or yearly).' 
+          }, true, request);
+        }
+        
+        console.log(`[USE CASE 2 - CHECKOUT] 🔍 Getting price ID for billing period: ${billingPeriodParam}`);
+        const priceId = await getPriceIdByBillingPeriod(env, billingPeriodParam);
+        console.log(`[USE CASE 2 - CHECKOUT] ✅ Price ID: ${priceId}`);
         
         if (!priceId) {
-              return jsonResponse(400, { 
-                error: 'missing_price', 
-            message: 'No price ID found for pending sites. Please add sites with valid price IDs.' 
-              }, true, request);
+          return jsonResponse(400, { 
+            error: 'price_not_configured', 
+            message: `Price ID not configured for ${billingPeriodParam} billing period. Please configure it in the database or environment variables.` 
+          }, true, request);
         }
 
         // Get price details to calculate total amount
@@ -8235,13 +8907,22 @@ export default {
         const totalAmount = unitAmount * uniquePendingSites.length;
 
         // Create single line item with total amount (like Use Case 3)
+        // Use the product_id from the price to ensure all site purchases use the same product
         form['line_items[0][price_data][currency]'] = price.currency || 'usd';
         form['line_items[0][price_data][unit_amount]'] = totalAmount;
-        form['line_items[0][price_data][product_data][name]'] = `Subscription for ${uniquePendingSites.length} site(s)`;
-                form['line_items[0][quantity]'] = 1;
+        
+        // Use product_id from price if available, otherwise create product_data
+        if (price.product) {
+          form['line_items[0][price_data][product]'] = price.product;
+        } else {
+          form['line_items[0][price_data][product_data][name]'] = `Subscription for ${uniquePendingSites.length} site(s)`;
+        }
+        
+        form['line_items[0][quantity]'] = 1;
                 
         // Store site names and metadata in payment_intent_data (like Use Case 3 stores license keys)
         const siteNames = uniquePendingSites.map(ps => ps.site || ps.site_domain);
+        console.log(`[USE CASE 2 - CHECKOUT] 📝 Storing metadata: ${siteNames.length} site(s):`, siteNames);
         form['payment_intent_data[metadata][usecase]'] = '2'; // Use Case 2 identifier
         form['payment_intent_data[metadata][purchase_type]'] = 'site'; // Distinguish from Use Case 3
         form['payment_intent_data[metadata][customer_id]'] = customerId;
@@ -8250,10 +8931,11 @@ export default {
         form['payment_intent_data[metadata][sites]'] = JSON.stringify(siteNames); // Store sites as JSON array
 
         // Create checkout session
+        console.log(`[USE CASE 2 - CHECKOUT] 💳 STEP 2.3: Creating Stripe checkout session...`);
         const session = await stripeFetch(env, '/checkout/sessions', 'POST', form, true);
         
         if (session.status >= 400) {
-          console.error(`❌ PAYMENT ERROR: Stripe checkout session creation failed (${session.status}):`, session.body);
+          console.error(`[USE CASE 2 - CHECKOUT] ❌ Stripe checkout session creation failed (${session.status}):`, session.body);
           return jsonResponse(500, { 
             error: 'stripe_checkout_failed', 
             message: 'Failed to create checkout session with Stripe. Please try again.',
@@ -8263,7 +8945,7 @@ export default {
         
         // Validate session was created successfully
         if (!session.body || !session.body.id || !session.body.url) {
-          console.error('❌ PAYMENT ERROR: Invalid checkout session response from Stripe');
+          console.error(`[USE CASE 2 - CHECKOUT] ❌ Invalid checkout session response from Stripe`);
           return jsonResponse(500, { 
             error: 'invalid_checkout_session', 
             message: 'Stripe returned an invalid checkout session. Please try again.',
@@ -8271,6 +8953,8 @@ export default {
           }, true, request);
         }
 
+        console.log(`[USE CASE 2 - CHECKOUT] ✅ STEP 2 COMPLETE: Checkout session created - ${session.body.id}`);
+        console.log(`[USE CASE 2 - CHECKOUT] 🔗 Checkout URL: ${session.body.url}`);
         return jsonResponse(200, {
           sessionId: session.body.id,
           url: session.body.url
@@ -8278,8 +8962,8 @@ export default {
       }
 
       // Remove a pending site (before payment)
-      // REMOVED: /remove-pending-site endpoint - Can be handled in frontend
-      if (false && request.method === 'POST' && pathname === '/remove-pending-site') {
+      // Remove pending site endpoint
+      if (request.method === 'POST' && pathname === '/remove-pending-site') {
         // Support both session cookie and email-based authentication
         const cookie = request.headers.get('cookie') || '';
         const match = cookie.match(/sb_session=([^;]+)/);
@@ -8443,6 +9127,7 @@ export default {
         }
 
         const { site, subscription_id } = body;
+        console.log (`[REMOVE-SITE] 🔍 Received request to remove site: ${site} for email: ${email} for subscriptionid ${subscription_id}`);
 
         if (!site) {
           console.error(`[REMOVE-SITE] ❌ Missing site parameter`);
@@ -8465,7 +9150,7 @@ export default {
           try {
             const normalizedRequestEmail = email.toLowerCase().trim();
             
-            const memberstackMember = await getMemberstackMember(email, env);
+            const memberstackMember = await this.getMemberstackMember(email, env);
             
             if (!memberstackMember) {
               console.error(`[REMOVE-SITE] ❌ Memberstack member not found for email: ${email}`);
@@ -9120,7 +9805,7 @@ export default {
 
         try {
           // 1️⃣ Create or get Memberstack user
-          const member = await createMemberstackMember(email, env);
+          const member = await this.createMemberstackMember(email, env);
 
           // 2️⃣ Assign plan
           await assignMemberstackPlan(member.id, env);
@@ -9140,9 +9825,12 @@ export default {
       // Purchase quantity endpoint - creates checkout for quantity-based license purchases
       // Purchase quantity endpoint - ADD INDIVIDUAL LICENSES
       // Queue processing endpoint - processes pending subscription creation tasks
+      // Can be called manually to process queue immediately (useful for debugging)
       if (request.method === 'POST' && pathname === '/process-queue') {
-        const { limit = 10 } = await request.json().catch(() => ({}));
+        const { limit = 100 } = await request.json().catch(() => ({}));
+        console.log(`[ENDPOINT] /process-queue called with limit: ${limit}`);
         const result = await processSubscriptionQueue(env, limit);
+        console.log(`[ENDPOINT] /process-queue result:`, result);
         return jsonResponse(200, result, true, request);
       }
       
@@ -9186,14 +9874,35 @@ export default {
       }
       
       if (request.method === 'POST' && pathname === '/purchase-quantity') {
-        const { email: emailParam, quantity, subscription_id: subscriptionIdParam } = await request.json();
+        console.log('[PURCHASE-QUANTITY] 📥 Request received');
+        
+        let requestBody;
+        try {
+          requestBody = await request.json();
+          console.log('[PURCHASE-QUANTITY] 📋 Request body:', { 
+            quantity: requestBody.quantity, 
+            billing_period: requestBody.billing_period,
+            email: requestBody.email ? 'provided' : 'not provided'
+          });
+        } catch (parseError) {
+          console.error('[PURCHASE-QUANTITY] ❌ Error parsing request body:', parseError);
+          return jsonResponse(400, {
+            error: 'invalid_request',
+            message: 'Invalid JSON in request body'
+          }, true, request);
+        }
+        
+        const { email: emailParam, quantity, subscription_id: subscriptionIdParam, billing_period: billingPeriodParam } = requestBody;
 
         if (!quantity || quantity < 1) {
+          console.log('[PURCHASE-QUANTITY] ❌ Invalid quantity:', quantity);
           return jsonResponse(400, {
             error: 'invalid_quantity',
             message: 'Quantity must be at least 1'
           }, true, request);
         }
+        
+        console.log('[PURCHASE-QUANTITY] ✅ Quantity validated:', quantity);
         
         // Safety limit: Maximum recommended quantity for safe subscription creation
         // Stripe API rate limit: ~100 requests/second
@@ -9202,6 +9911,7 @@ export default {
         const MAX_RECOMMENDED_QUANTITY = parseInt(env.MAX_QUANTITY_PER_PURCHASE) || 25;
         
         if (quantity > MAX_RECOMMENDED_QUANTITY) {
+          console.log('[PURCHASE-QUANTITY] ❌ Quantity too large:', quantity, 'max:', MAX_RECOMMENDED_QUANTITY);
           return jsonResponse(400, {
             error: 'quantity_too_large',
             message: `Quantity cannot exceed ${MAX_RECOMMENDED_QUANTITY} licenses per purchase. Please purchase in smaller batches.`,
@@ -9230,20 +9940,27 @@ export default {
         }
 
         if (!email.includes('@')) {
+          console.log('[PURCHASE-QUANTITY] ❌ Invalid email format:', email);
           return jsonResponse(400, { error: 'invalid_email' }, true, request);
         }
+
+        console.log('[PURCHASE-QUANTITY] ✅ Email validated:', email);
 
         /* ─────────────────────────────
            LOAD USER & SUBSCRIPTION
         ───────────────────────────── */
+        console.log('[PURCHASE-QUANTITY] 🔍 Loading user from database...');
         const user = await getUserByEmail(env, email);
 
         if (!user?.customers?.length) {
+          console.log('[PURCHASE-QUANTITY] ❌ No customer found for email:', email);
           return jsonResponse(400, {
             error: 'no_customer',
             message: 'Customer account required'
           }, true, request);
         }
+        
+        console.log('[PURCHASE-QUANTITY] ✅ User found with', user.customers.length, 'customer(s)');
 
         /* ─────────────────────────────
            GET CUSTOMER ID
@@ -9266,15 +9983,53 @@ export default {
         }
 
         /* ─────────────────────────────
-           PRICE
+           PRICE - From Environment Variables (fastest - no database query)
+           Reads from env vars: MONTHLY_PRODUCT_ID, MONTHLY_UNIT_AMOUNT, etc.
         ───────────────────────────── */
-        const priceId = env.LICENSE_PRICE_ID || env.DEFAULT_PRICE_ID;
-        if (!priceId) {
-          return jsonResponse(500, {
-            error: 'price_not_configured',
-            message: 'License price ID not configured'
+        if (!billingPeriodParam) {
+          console.log('[PURCHASE-QUANTITY] ❌ Billing period not provided');
+          return jsonResponse(400, {
+            error: 'billing_period_required',
+            message: 'billing_period is required. Please provide "monthly" or "yearly".'
           }, true, request);
         }
+        
+        const normalizedPeriod = billingPeriodParam.toLowerCase().trim();
+        console.log('[PURCHASE-QUANTITY] 📅 Billing period:', normalizedPeriod);
+        
+        // Get price configuration from environment variables
+        let productId, unitAmount, currency;
+        
+        if (normalizedPeriod === 'monthly') {
+          productId = env.MONTHLY_PRODUCT_ID || env.MONTHLY_LICENSE_PRODUCT_ID || 'prod_TiX0VbsXQSm4N5';
+          unitAmount = parseInt(env.MONTHLY_UNIT_AMOUNT || env.MONTHLY_LICENSE_UNIT_AMOUNT || '800');
+          currency = env.MONTHLY_CURRENCY || env.CURRENCY || 'usd';
+          console.log('[PURCHASE-QUANTITY] 💰 Monthly config:', { productId, unitAmount, currency });
+        } else if (normalizedPeriod === 'yearly') {
+          productId = env.YEARLY_PRODUCT_ID || env.YEARLY_LICENSE_PRODUCT_ID || 'prod_TiX0CF9K1RSRyb';
+          unitAmount = parseInt(env.YEARLY_UNIT_AMOUNT || env.YEARLY_LICENSE_UNIT_AMOUNT || '7200');
+          currency = env.YEARLY_CURRENCY || env.CURRENCY || 'usd';
+          console.log('[PURCHASE-QUANTITY] 💰 Yearly config:', { productId, unitAmount, currency });
+              } else {
+          console.log('[PURCHASE-QUANTITY] ❌ Invalid billing period:', billingPeriodParam);
+                return jsonResponse(400, {
+            error: 'invalid_billing_period',
+            message: `Invalid billing_period: ${billingPeriodParam}. Must be "monthly" or "yearly".`
+                }, true, request);
+        }
+        
+        if (!productId) {
+          console.log('[PURCHASE-QUANTITY] ❌ Product ID not configured for:', normalizedPeriod);
+          return jsonResponse(500, {
+            error: 'product_id_not_configured',
+            message: `${normalizedPeriod.charAt(0).toUpperCase() + normalizedPeriod.slice(1)} product ID not configured. Please set MONTHLY_PRODUCT_ID or YEARLY_PRODUCT_ID in environment variables.`
+          }, true, request);
+        }
+        
+        // Use variables directly (already set from environment)npm run =
+        const storedUnitAmount = unitAmount;
+        const storedCurrency = currency;
+        console.log(`[PURCHASE-QUANTITY] ✅ Price config loaded (${normalizedPeriod}):`, { productId, storedUnitAmount, storedCurrency });
 
         /* ─────────────────────────────
            STEP 1: CALCULATE AMOUNT (FULL PRICE FOR NEW SUBSCRIPTIONS)
@@ -9282,36 +10037,21 @@ export default {
            Since we're creating NEW subscriptions, there's no proration - charge full price
         ───────────────────────────── */
         let proratedAmount = 0;
-        let invoiceCurrency = 'usd'; // Default currency
-        const licenseKeys = generateLicenseKeys(quantity);
+        let invoiceCurrency = storedCurrency || 'usd'; // Use currency from environment or default
+        // Generate temporary license keys (e.g., "L1", "L2") for metadata storage
+        // Temporary keys are shorter and fit within Stripe's 500 character metadata limit
+        // Real unique license keys will be generated later during subscription creation
+        const licenseKeys = await generateTempLicenseKeys(quantity);
         
-        try {
-          // Get price details for full price calculation
-          const priceRes = await stripeFetch(env, `/prices/${priceId}`);
-          if (priceRes.status === 200) {
-            const price = priceRes.body;
-            const unitPrice = price.unit_amount || 0;
-            invoiceCurrency = price.currency || 'usd';
-            
-            // For Option 2 (separate subscriptions), charge full price per license
-            // No proration needed since we're creating NEW subscriptions
-            proratedAmount = unitPrice * quantity;
-          } else {
-            console.warn(`[USE CASE 3] ⚠️ Could not get price details, status: ${priceRes.status}`);
-            proratedAmount = 0;
-          }
-        } catch (invoiceErr) {
-          console.error('[USE CASE 3] ❌ Error getting prorated amount:', invoiceErr);
-          // Fallback: Calculate estimated amount
-          try {
-            const priceRes = await stripeFetch(env, `/prices/${priceId}`);
-            if (priceRes.status === 200) {
-              const price = priceRes.body;
-              proratedAmount = (price.unit_amount || 0) * quantity;
-            }
-          } catch (priceErr) {
-            console.error('[USE CASE 3] ❌ Error getting price for fallback:', priceErr);
-          }
+        // Calculate total amount using unit_amount from environment variables (no database or Stripe API call needed)
+        proratedAmount = storedUnitAmount * quantity;
+        console.log(`[USE CASE 3] Using unit_amount from environment: ${storedUnitAmount}, currency: ${invoiceCurrency}, total: ${proratedAmount}`);
+        
+        if (!productId) {
+          return jsonResponse(500, {
+            error: 'product_id_missing',
+            message: `Product ID not configured for ${billingPeriodParam} billing period.`
+          }, true, request);
         }
 
         /* ─────────────────────────────
@@ -9326,8 +10066,9 @@ export default {
           await stripeFetch(env, `/customers/${customerId}`, 'POST', {
             'metadata[license_keys_pending]': JSON.stringify(licenseKeys),
             'metadata[usecase]': '3', // Primary identifier for Use Case 3
-            'metadata[price_id]': priceId, // Store price ID for webhook
-            'metadata[quantity]': quantity.toString() // Store quantity for webhook
+            'metadata[product_id]': productId, // Store product_id for webhook (can get price_id from this)
+            'metadata[quantity]': quantity.toString(), // Store quantity for webhook
+            'metadata[billing_period]': normalizedPeriod // Store billing period for reference
           }, true);
         } catch (metadataErr) {
           console.warn(`[USE CASE 3] ⚠️ Failed to store metadata in customer:`, metadataErr);
@@ -9341,52 +10082,240 @@ export default {
           env.MEMBERSTACK_REDIRECT_URL ||
           'https://memberstack-login-test-713fa5.webflow.io/dashboard';
 
-        // Create checkout session with the prorated amount
-        // Subscription items will be added AFTER payment succeeds with proration_behavior: 'none'
+       
         const form = {
           mode: 'payment', // One-time payment for prorated amount
           customer: customerId,
           'payment_method_types[0]': 'card',
-          // Use custom price_data with prorated amount retrieved from Stripe
+          // Use custom price_data with prorated amount and product_id from environment variables
           'line_items[0][price_data][currency]': invoiceCurrency,
           'line_items[0][price_data][unit_amount]': proratedAmount,
-          'line_items[0][price_data][product_data][name]': `${quantity} License${quantity > 1 ? 's' : ''} Purchase`,
-          'line_items[0][price_data][product_data][description]': `Creating ${quantity} new subscription${quantity > 1 ? 's' : ''} (one per license) for individual management`,
+          'line_items[0][price_data][product]': productId, // Use product_id from environment
           'line_items[0][quantity]': 1, // Always 1 since amount is already prorated
           'payment_intent_data[metadata][usecase]': '3', // Primary identifier for Use Case 3
           'payment_intent_data[metadata][customer_id]': customerId, // Required for webhook
-          'payment_intent_data[metadata][license_keys]': JSON.stringify(licenseKeys), // Required: license keys
-          'payment_intent_data[metadata][price_id]': priceId, // Required: to create subscriptions after payment
+          // For large quantities, license_keys may exceed 500 char limit - store in customer metadata instead
+          // Only store in payment_intent_data if it fits within Stripe's 500 character limit
+          ...(JSON.stringify(licenseKeys).length <= 450 ? {
+            'payment_intent_data[metadata][license_keys]': JSON.stringify(licenseKeys) // Store if within limit
+          } : {
+            'payment_intent_data[metadata][license_keys_count]': quantity.toString(), // Store count instead
+            'payment_intent_data[metadata][license_keys_source]': 'customer_metadata' // Indicate where to find keys
+          }),
+          'payment_intent_data[metadata][product_id]': productId, // Required: to create subscriptions after payment (webhook can get price_id from this)
           'payment_intent_data[metadata][quantity]': quantity.toString(), // Required: quantity to create
           'payment_intent_data[metadata][currency]': invoiceCurrency, // Store currency for reference
+          'payment_intent_data[metadata][billing_period]': normalizedPeriod, // Store billing period for reference
           'payment_intent_data[setup_future_usage]': 'off_session', // Save payment method for future subscriptions
           'success_url': `${dashboardUrl}?session_id={CHECKOUT_SESSION_ID}&payment=success`,
           'cancel_url': dashboardUrl
         };
 
+        console.log('[PURCHASE-QUANTITY] 💳 Creating Stripe checkout session...', {
+          amount: proratedAmount,
+          currency: invoiceCurrency,
+          quantity: quantity,
+          productId: productId
+        });
+
         const session = await stripeFetch(env, '/checkout/sessions', 'POST', form, true);
 
         if (session.status >= 400) {
           // No rollback needed - items will be added after payment succeeds
-          console.error('[USE CASE 3] ❌ Checkout session creation failed:', session.body);
+          console.error('[PURCHASE-QUANTITY] ❌ Checkout session creation failed:', {
+            status: session.status,
+            body: session.body
+          });
           
           return jsonResponse(500, {
             error: 'checkout_failed',
-            message: 'Failed to create checkout session'
+            message: 'Failed to create checkout session',
+            details: session.body
           }, true, request);
         }
 
-        return jsonResponse(200, {
+        console.log('[PURCHASE-QUANTITY] ✅ Checkout session created successfully:', {
+          session_id: session.body.id,
+          checkout_url: session.body.url ? 'present' : 'missing'
+        });
+
+        const response = {
           checkout_url: session.body.url,
           session_id: session.body.id,
           prorated_amount: proratedAmount,
           currency: invoiceCurrency,
           quantity: quantity,
           license_keys: licenseKeys.length
-        }, true, request);
+        };
+        
+        console.log('[PURCHASE-QUANTITY] 📤 Returning response:', {
+          has_checkout_url: !!response.checkout_url,
+          session_id: response.session_id,
+          quantity: response.quantity
+        });
+        
+        return jsonResponse(200, response, true, request);
       }
 
-      // Activate license endpoint - associates a license key with a site
+      // Check license status for a site
+      if ((request.method === 'GET' || request.method === 'POST') && pathname === '/check-license-status') {
+        // Get site domain from URL parameters (GET) or request body (POST)
+        let site_domain = null;
+        let email = null;
+        
+        if (request.method === 'GET') {
+          site_domain = url.searchParams.get('site') || url.searchParams.get('site_domain') || url.searchParams.get('domain');
+          email = url.searchParams.get('email');
+        } else {
+          const body = await request.json().catch(() => ({}));
+          site_domain = body.site || body.site_domain || body.domain;
+          email = body.email;
+        }
+        
+        if (!site_domain) {
+          return jsonResponse(400, { 
+            error: 'missing_site', 
+            message: 'Site domain is required. Provide it as URL parameter: ?site=example.com or in request body.' 
+          }, true, request);
+        }
+        
+        // Normalize site domain
+        const normalizedSite = site_domain.toLowerCase().trim();
+        
+        console.log(`[check-license-status] 🔍 Checking license status for site: ${normalizedSite}`);
+        
+        if (!env.DB) {
+          return jsonResponse(500, { error: 'database_not_configured', message: 'Database not configured' }, true, request);
+        }
+        
+        try {
+          // Check for active license with this site domain
+          // Check both used_site_domain (activated licenses) and site_domain (site-based purchases)
+          const licenseRes = await env.DB.prepare(
+            `SELECT 
+              license_key, 
+              customer_id, 
+              subscription_id, 
+              item_id,
+              site_domain,
+              used_site_domain,
+              status, 
+              purchase_type,
+              billing_period,
+              renewal_date,
+              created_at,
+              updated_at
+            FROM licenses 
+            WHERE (LOWER(TRIM(used_site_domain)) = ? OR LOWER(TRIM(site_domain)) = ?)
+            AND status = 'active'
+            ORDER BY updated_at DESC
+            LIMIT 1`
+          ).bind(normalizedSite, normalizedSite).first();
+          
+          if (!licenseRes) {
+            console.log(`[check-license-status] ❌ No active license found for site: ${normalizedSite}`);
+            return jsonResponse(200, {
+              success: false,
+              available: false,
+              site: site_domain,
+              message: 'No active license found for this site',
+              license: null
+            }, true, request);
+          }
+          
+          // If email is provided, verify the license belongs to that user
+          if (email) {
+            const normalizedEmail = email.toLowerCase().trim();
+            const user = await getUserByEmail(env, normalizedEmail);
+            
+            if (user && user.customers) {
+              const customerIds = user.customers.map(c => c.customerId);
+              if (!customerIds.includes(licenseRes.customer_id)) {
+                console.log(`[check-license-status] ❌ License does not belong to user: ${normalizedEmail}`);
+                return jsonResponse(200, {
+                  success: false,
+                  available: false,
+                  site: site_domain,
+                  message: 'No active license found for this site in your account',
+                  license: null
+                }, true, request);
+              }
+            }
+          }
+          
+          // Get subscription details if available
+          let subscriptionDetails = null;
+          if (licenseRes.subscription_id) {
+            try {
+              const subRes = await env.DB.prepare(
+                'SELECT subscription_id, status, current_period_end, cancel_at_period_end FROM subscriptions WHERE subscription_id = ? LIMIT 1'
+              ).bind(licenseRes.subscription_id).first();
+              
+              if (subRes) {
+                subscriptionDetails = {
+                  subscription_id: subRes.subscription_id,
+                  status: subRes.status,
+                  current_period_end: subRes.current_period_end,
+                  cancel_at_period_end: subRes.cancel_at_period_end === 1
+                };
+              }
+            } catch (subError) {
+              console.warn(`[check-license-status] ⚠️ Could not fetch subscription details:`, subError.message);
+            }
+          }
+          
+          // Format expiration date
+          let expirationDate = null;
+          if (licenseRes.renewal_date) {
+            try {
+              const timestamp = typeof licenseRes.renewal_date === 'number' ? licenseRes.renewal_date : parseInt(licenseRes.renewal_date);
+              const dateInMs = timestamp < 1e12 ? timestamp * 1000 : timestamp;
+              expirationDate = new Date(dateInMs).toISOString();
+            } catch (e) {
+              console.warn(`[check-license-status] ⚠️ Error parsing expiration date:`, e);
+            }
+          } else if (subscriptionDetails && subscriptionDetails.current_period_end) {
+            try {
+              const timestamp = typeof subscriptionDetails.current_period_end === 'number' ? subscriptionDetails.current_period_end : parseInt(subscriptionDetails.current_period_end);
+              const dateInMs = timestamp < 1e12 ? timestamp * 1000 : timestamp;
+              expirationDate = new Date(dateInMs).toISOString();
+            } catch (e) {
+              console.warn(`[check-license-status] ⚠️ Error parsing subscription expiration date:`, e);
+            }
+          }
+          
+          console.log(`[check-license-status] ✅ Found active license for site: ${normalizedSite}`);
+          
+          return jsonResponse(200, {
+            success: true,
+            available: true,
+            site: site_domain,
+            message: 'Active license found for this site',
+            license: {
+              license_key: licenseRes.license_key,
+              status: licenseRes.status,
+              purchase_type: licenseRes.purchase_type,
+              site_domain: licenseRes.site_domain,
+              used_site_domain: licenseRes.used_site_domain,
+              billing_period: licenseRes.billing_period,
+              expiration_date: expirationDate,
+              renewal_date: licenseRes.renewal_date,
+              created_at: licenseRes.created_at,
+              updated_at: licenseRes.updated_at,
+              subscription: subscriptionDetails
+            }
+          }, true, request);
+          
+        } catch (error) {
+          console.error(`[check-license-status] ❌ Error checking license status:`, error);
+          return jsonResponse(500, { 
+            error: 'database_error', 
+            message: 'Failed to check license status',
+            details: error.message 
+          }, true, request);
+        }
+      }
+      
       if (request.method === 'POST' && pathname === '/activate-license') {
         const body = await request.json();
         const { license_key, site_domain, email: emailParam } = body;
@@ -9422,7 +10351,7 @@ export default {
           
           // Check if license exists and get full details
           const licenseRes = await env.DB.prepare(
-            'SELECT license_key, used_site_domain, status, customer_id, subscription_id, item_id, purchase_type FROM licenses WHERE license_key = ?'
+            'SELECT license_key, site_domain, used_site_domain, status, customer_id, subscription_id, item_id, purchase_type FROM licenses WHERE license_key = ?'
           ).bind(license_key).first();
           
           if (!licenseRes) {
@@ -9547,10 +10476,49 @@ export default {
             }
           }
           
-          // Allow updating site domain if already used (don't block, just update)
-          const isUpdating = !!licenseRes.used_site_domain;
-          if (isUpdating) {
+          // CRITICAL: Check if license is from site-based purchase (has site_domain set)
+          // Site-based licenses are pre-assigned to a specific site and cannot be used for other sites
+          if (licenseRes.site_domain && licenseRes.site_domain.trim() !== '') {
+            const normalizedOriginalSite = licenseRes.site_domain.toLowerCase().trim();
+            const normalizedRequestedSite = site_domain.toLowerCase().trim();
+            
+            if (normalizedOriginalSite !== normalizedRequestedSite) {
+              console.error(`[activate-license] ❌ License ${license_key} is tied to site ${licenseRes.site_domain} and cannot be used for ${site_domain}`);
+              return jsonResponse(400, { 
+                error: 'license_site_mismatch', 
+                message: `This license key is tied to the site "${licenseRes.site_domain}" and cannot be used for other sites. Please use the correct license key for "${site_domain}".`,
+                original_site: licenseRes.site_domain,
+                requested_site: site_domain
+              }, true, request);
+            }
+            
+            // Site matches - check if already activated
+            if (licenseRes.used_site_domain) {
+              console.log(`[activate-license] ℹ️ License ${license_key} is already activated for site ${licenseRes.used_site_domain}`);
+              // Site-based licenses are already "used" - return success but don't allow reuse
+              return jsonResponse(400, { 
+                error: 'license_already_used', 
+                message: `This license key is already activated and tied to "${licenseRes.used_site_domain}". Site-based licenses cannot be reused or transferred.`,
+                activated_site: licenseRes.used_site_domain
+              }, true, request);
+            }
           }
+          
+          // Check if license is already activated (for quantity-based purchases)
+          const isAlreadyActivated = !!licenseRes.used_site_domain;
+          
+          // If already activated, prevent reuse
+          if (isAlreadyActivated) {
+            console.error(`[activate-license] ❌ License ${license_key} is already activated for site ${licenseRes.used_site_domain} and cannot be reused`);
+            return jsonResponse(400, { 
+              error: 'license_already_used', 
+              message: `This license key is already activated and used for "${licenseRes.used_site_domain}". Licenses cannot be reused or transferred to other sites.`,
+              activated_site: licenseRes.used_site_domain
+            }, true, request);
+          }
+          
+          // First-time activation - mark as activated
+          console.log(`[activate-license] ✅ Activating license ${license_key} for the first time with site: ${site_domain}`);
           
           // Check if inactive
           if (licenseRes.status !== 'active') {
@@ -9560,11 +10528,111 @@ export default {
           
           const timestamp = Math.floor(Date.now() / 1000);
           
-          // Step 1: Update license with used site domain
+          // Step 1: Update license with used site domain (this marks it as activated)
+          // Once used_site_domain is set, the license is considered activated
           const licenseUpdate = await env.DB.prepare(
             'UPDATE licenses SET used_site_domain = ?, updated_at = ? WHERE license_key = ?'
           ).bind(site_domain, timestamp, license_key).run();
           
+          // Update KV storage with site details (for license key activation)
+          if (licenseRes.subscription_id && licenseRes.customer_id) {
+            console.log(`[activate-license] 💾 Updating KV storage for license key: ${license_key}`);
+            
+            // Always clean up old KV entries before saving new one
+            // This handles both first activation and domain updates
+            try {
+              if (env.ACTIVE_SITES_CONSENTBIT) {
+                // 1. Delete old entry keyed by license key (always, for backward compatibility)
+                try {
+                  const oldLicenseKeyEntry = await env.ACTIVE_SITES_CONSENTBIT.get(license_key);
+                  if (oldLicenseKeyEntry) {
+                    await env.ACTIVE_SITES_CONSENTBIT.delete(license_key);
+                    console.log(`[activate-license] 🗑️ Deleted old KV entry keyed by license key: ${license_key}`);
+                  }
+                } catch (deleteLicenseKeyErr) {
+                  // Entry might not exist, that's okay
+                  console.log(`[activate-license] ℹ️ No existing KV entry found for license key: ${license_key}`);
+                }
+                
+                // 2. If updating domain (not first activation), delete old domain entry
+                if (isAlreadyActivated && licenseRes.used_site_domain && licenseRes.used_site_domain !== site_domain) {
+                  const oldFormattedDomain = formatSiteName(licenseRes.used_site_domain);
+                  if (oldFormattedDomain) {
+                    try {
+                      const oldDomainEntry = await env.ACTIVE_SITES_CONSENTBIT.get(oldFormattedDomain);
+                      if (oldDomainEntry) {
+                        await env.ACTIVE_SITES_CONSENTBIT.delete(oldFormattedDomain);
+                        console.log(`[activate-license] 🗑️ Deleted old KV entry for previous domain: ${oldFormattedDomain}`);
+                      }
+                    } catch (deleteDomainErr) {
+                      console.warn(`[activate-license] ⚠️ Could not delete old domain KV entry:`, deleteDomainErr.message);
+                      // Non-critical, continue
+                    }
+                  }
+                }
+              }
+            } catch (deleteErr) {
+              console.warn(`[activate-license] ⚠️ Error during KV cleanup:`, deleteErr.message);
+              // Non-critical, continue - we'll still save the new entry
+            }
+            
+            // Get subscription cancel_at_period_end status for KV storage
+            let cancelAtPeriodEnd = false;
+            try {
+              const subDetails = await env.DB.prepare(
+                'SELECT cancel_at_period_end FROM subscriptions WHERE subscription_id = ? LIMIT 1'
+              ).bind(licenseRes.subscription_id).first();
+              if (subDetails) {
+                cancelAtPeriodEnd = subDetails.cancel_at_period_end === 1;
+              }
+            } catch (subErr) {
+              console.warn(`[activate-license] ⚠️ Could not fetch subscription cancel status:`, subErr.message);
+            }
+            
+            // CRITICAL: Ensure site_domain is not item_id - validate it's a proper domain
+            // item_id typically starts with 'si_' (Stripe subscription item ID)
+            // If site_domain looks like an item_id, use the previous used_site_domain or reject
+            let validatedSiteDomain = site_domain;
+            
+            if (!site_domain || site_domain.trim() === '') {
+              console.error(`[activate-license] ❌ Empty site_domain provided`);
+              return jsonResponse(400, { 
+                error: 'invalid_site_domain', 
+                message: 'Site domain cannot be empty.' 
+              }, true, request);
+            }
+            
+            // Check if site_domain is actually an item_id (Stripe item IDs start with 'si_')
+            if (site_domain.startsWith('si_') || site_domain.startsWith('item_') || site_domain.match(/^[a-z]{2}_[a-zA-Z0-9]+$/)) {
+              console.error(`[activate-license] ❌ Invalid site_domain provided: "${site_domain}". This appears to be an item_id, not a domain name.`);
+              
+              // If updating and we have a previous valid domain, use that instead
+              if (isAlreadyActivated && licenseRes.used_site_domain && 
+                  !licenseRes.used_site_domain.startsWith('si_') && 
+                  !licenseRes.used_site_domain.startsWith('item_')) {
+                console.warn(`[activate-license] ⚠️ Using previous valid domain: ${licenseRes.used_site_domain}`);
+                validatedSiteDomain = licenseRes.used_site_domain;
+              } else {
+                return jsonResponse(400, { 
+                  error: 'invalid_site_domain', 
+                  message: `Invalid site domain provided: "${site_domain}". Expected a domain name (e.g., example.com), not an item ID.` 
+                }, true, request);
+              }
+            }
+            
+            console.log(`[activate-license] ✅ Using validated site domain: ${validatedSiteDomain} (original: ${site_domain})`);
+            
+            await saveLicenseKeyToKV(
+              env,
+              license_key,
+              licenseRes.customer_id,
+              licenseRes.subscription_id,
+              email,
+              'complete', // License is active
+              cancelAtPeriodEnd,
+              validatedSiteDomain // Use validated site domain (not item_id)
+            );
+          }
           
           // Step 2: Update or create site entry in sites table
           if (licenseRes.subscription_id && licenseRes.customer_id) {
@@ -9672,10 +10740,10 @@ export default {
             }
           }
           
-          const actionText = isUpdating ? 'updated' : 'activated';
-          const message = isUpdating 
-            ? `License site updated successfully from ${licenseRes.used_site_domain} to ${site_domain}`
-            : 'License activated successfully';
+          const actionText = isAlreadyActivated ? 'updated' : 'activated';
+          const message = isAlreadyActivated 
+            ? `License site domain updated successfully from ${licenseRes.used_site_domain} to ${site_domain}`
+            : `License activated successfully for ${site_domain}`;
           
           
           return jsonResponse(200, { 
@@ -9683,10 +10751,11 @@ export default {
             message: message,
             license_key: license_key,
             site_domain: site_domain,
-            previous_site: isUpdating ? licenseRes.used_site_domain : null,
+            previous_site: isAlreadyActivated ? licenseRes.used_site_domain : null,
             status: 'used',
             is_used: true,
-            was_update: isUpdating
+            is_activated: true,
+            was_update: isAlreadyActivated
           }, true, request);
         } catch (error) {
           console.error('[activate-license] ❌ Error:', error);
@@ -9929,7 +10998,7 @@ export default {
       return new Response('not found', { status: 404 });
     } catch (err) {
       console.error('Error in request handler:', err);
-      return new Response('Internal server error', { status: 500 });
+      return jsonResponse(500, { error: 'internal_server_error', message: err.message || 'Internal server error' }, true, request);
     }
   },
 
