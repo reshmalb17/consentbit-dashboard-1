@@ -1,345 +1,328 @@
-# Direct Payment Link Metadata Guide
+# Use Case 1: Direct Payment Link Metadata Guide
 
-This guide explains what metadata you need to add to Stripe Payment Links for direct payment processing (Use Case 1).
+## Overview
 
----
+**Use Case 1** = Direct Payment Links created in **Stripe Dashboard** → **Products** → **Payment Links**. 
 
-## 🎯 Quick Answer
-
-For **direct payment links**, you need to add this metadata in **Stripe Dashboard**:
-
-### Required Metadata:
-- ✅ `paymentby: 'directlink'` - Identifies this as a direct payment link
-
-### Optional Metadata:
-- ⚪ `usecase: '1'` - Explicitly marks as Use Case 1 (optional, defaults to Use Case 1 if not set)
+These links:
+- Use **subscription mode** (not payment mode)
+- Are identified automatically when `session.mode === 'subscription'`
+- Default to Use Case 1 if no other use case metadata is set
 
 ---
 
-## 📋 Where to Add Metadata
+## Required Metadata for Use Case 1
 
-### Option 1: Payment Link Metadata (Recommended)
+### In Stripe Dashboard (Payment Link Settings)
 
-**Location:** Stripe Dashboard → Products → Payment Links → Your Payment Link → Settings → Metadata
+When creating or editing a Payment Link in Stripe Dashboard, you can add metadata in the **Advanced options** or **Metadata** section:
+
+#### 1. **Product Metadata** (Required)
+
+Add metadata to the **Product** itself (not the Payment Link):
+
+- **Key:** `usedfor`
+- **Value:** `dashboard`
 
 **Steps:**
-1. Go to Stripe Dashboard
-2. Navigate to **Products** → **Payment Links**
-3. Click on your payment link
-4. Go to **Settings** tab
-5. Scroll to **Metadata** section
-6. Click **Add metadata**
-7. Add the following:
+1. Go to **Stripe Dashboard** → **Products**
+2. Click on your product
+3. Scroll to **Metadata** section
+4. Add: Key = `usedfor`, Value = `dashboard`
+5. Click **Save**
 
-| Key | Value | Description |
-|-----|-------|-------------|
-| `paymentby` | `directlink` | Identifies this as a direct payment link |
-| `usecase` | `1` | (Optional) Explicitly marks as Use Case 1 |
+**Why:** This tells the webhook to process this product for the dashboard.
 
-**Example:**
-```
-Key: paymentby
-Value: directlink
+---
 
-Key: usecase
-Value: 1
-```
+#### 2. **Payment Link Metadata** (Optional but Recommended)
 
-### Option 2: Checkout Session Metadata (If creating via API)
+You can add metadata to the Payment Link itself. This metadata flows to the checkout session and subscription:
 
-If you're creating checkout sessions programmatically, add metadata like this:
+##### Option A: Via Stripe Dashboard (if supported)
+
+If Stripe Dashboard allows metadata on Payment Links:
+- **Key:** `paymentby`
+- **Value:** `directlink`
+
+##### Option B: Via API (Recommended)
+
+When creating a Payment Link via API, you can set:
 
 ```javascript
-const session = await stripe.checkout.sessions.create({
-  mode: 'subscription',
-  line_items: [{ price: 'price_xxxxx', quantity: 1 }],
-  metadata: {
-    paymentby: 'directlink',
-    usecase: '1'  // Optional
-  },
-  subscription_data: {
-    metadata: {
-      paymentby: 'directlink',
-      usecase: '1'  // Optional
-    }
+{
+  "metadata": {
+    "paymentby": "directlink",
+    "add_to_existing": "false",  // Optional: "true" to add to existing subscription
+    "existing_subscription_id": null  // Optional: subscription ID if adding to existing
   }
-});
+}
 ```
 
 ---
 
-## 🔍 How Metadata is Used
+## How Use Case 1 is Identified
 
-### Metadata Check Order
-
-The code checks metadata in this order:
-
-1. **`session.metadata`** - From payment link/checkout session
-2. **`subscription.metadata`** - From subscription object
-3. **`session.subscription_data.metadata`** - From subscription data in session
-
-### Code Logic
+The webhook automatically identifies Use Case 1 when:
 
 ```javascript
-// Check session.metadata FIRST (payment link metadata flows here)
-if (session && session.metadata) {
-  if (session.metadata.paymentby) {
-    paymentBy = session.metadata.paymentby;
-  }
-}
-
-// If paymentby is 'directlink', force new subscription creation
-if (paymentBy && paymentBy.toLowerCase() === 'directlink') {
-  isDirectLink = true;
-  addToExisting = false;
-  existingSubscriptionId = null;
-  purchaseType = 'site';  // Direct links collect site domain via custom field
+if (sessionMode === 'subscription') {
+  identifiedUseCase = '1'; // Use Case 1: Direct payment link
 }
 ```
 
----
-
-## ✅ Required Metadata Fields
-
-### 1. `paymentby: 'directlink'`
-
-**Purpose:** Identifies the payment as coming from a direct payment link
-
-**Effect:**
-- Forces creation of a **new subscription** (Use Case 1)
-- Prevents adding to existing subscription
-- Sets `purchaseType` to `'site'`
-
-**Where to add:** Payment Link → Settings → Metadata
-
-**Example:**
-```
-Key: paymentby
-Value: directlink
-```
+**Key Point:** Use Case 1 is the **default** for subscription mode checkouts. No `usecase` metadata is required - it's automatically detected.
 
 ---
 
-## ⚪ Optional Metadata Fields
+## How Metadata Flows
 
-### 2. `usecase: '1'`
+### 1. **Product Metadata** → Webhook Processing (REQUIRED)
 
-**Purpose:** Explicitly marks this as Use Case 1 (direct payment link)
-
-**Effect:**
-- Makes it clear this is Use Case 1
-- Helps with debugging and logging
-
-**Note:** If not set, the system defaults to Use Case 1 when `paymentby: 'directlink'` is present
-
-**Where to add:** Payment Link → Settings → Metadata
-
-**Example:**
 ```
-Key: usecase
-Value: 1
+Product (metadata.usedfor = "dashboard")
+  ↓
+Subscription created from Payment Link
+  ↓
+Webhook checks product.metadata.usedfor
+  ↓
+If "dashboard" → Process payment ✅
+If not → Skip processing ❌
+```
+
+### 2. **Payment Link Metadata** → Session/Subscription Metadata (OPTIONAL)
+
+```
+Payment Link (metadata.paymentby = "directlink")
+  ↓
+Checkout Session (session.metadata.paymentby)
+  ↓
+Subscription (subscription.metadata.paymentby)
+  ↓
+Webhook reads metadata to determine behavior
+```
+
+### 3. **Custom Fields** → Site URL (OPTIONAL)
+
+```
+Payment Link Custom Field: "Enter Your Live Domain"
+  ↓
+Checkout Session (session.custom_fields)
+  ↓
+Webhook extracts site URL
+  ↓
+Saves site domain with license
 ```
 
 ---
 
-## 🚫 What NOT to Add
+## Metadata Fields Explained
 
-### Don't Add These (For Direct Payment Links):
+### Product Metadata
 
-- ❌ `add_to_existing: 'true'` - This would try to add to existing subscription
-- ❌ `existing_subscription_id: 'sub_xxxxx'` - This would target a specific subscription
-- ❌ `usecase: '2'` or `usecase: '3'` - These are for other use cases
+| Key | Value | Required | Purpose |
+|-----|-------|----------|---------|
+| `usedfor` | `dashboard` | ✅ **Yes** | Identifies product as dashboard product |
 
-**Why:** Direct payment links should always create **new subscriptions**, not add to existing ones.
+### Payment Link / Session Metadata
 
----
-
-## 📝 Complete Metadata Example
-
-### For Direct Payment Link (Use Case 1):
-
-**In Stripe Dashboard → Payment Link → Metadata:**
-
-```
-Metadata:
-├─ paymentby: directlink
-└─ usecase: 1
-```
-
-**Result:**
-- ✅ Creates new subscription
-- ✅ Generates license keys
-- ✅ Processes as Use Case 1
-- ✅ Collects site domain from custom field
+| Key | Value | Required | Purpose |
+|-----|-------|----------|---------|
+| `paymentby` | `directlink` | ⚠️ Optional | Identifies payment as direct link purchase |
+| `add_to_existing` | `true` or `false` | ⚠️ Optional | Whether to add to existing subscription |
+| `existing_subscription_id` | Subscription ID | ⚠️ Optional | Subscription ID if adding to existing |
 
 ---
 
-## 🔄 Comparison with Other Use Cases
+## What Happens Without Metadata
 
-| Use Case | Metadata | Purpose |
-|----------|----------|---------|
-| **Use Case 1** (Direct Link) | `paymentby: 'directlink'` | Creates new subscription |
-| **Use Case 2** (Site Purchase) | `usecase: '2'`, `purchase_type: 'site'` | Creates separate subscription per site |
-| **Use Case 3** (License Purchase) | `usecase: '3'`, `purchase_type: 'quantity'` | Creates separate subscription per license |
+### Without Product Metadata (`usedfor: dashboard`):
+
+- ❌ Webhook will **skip processing** the payment
+- ❌ No licenses will be created
+- ❌ Payment will be successful in Stripe but not processed in dashboard
+
+### Without Payment Link Metadata:
+
+- ✅ Payment will still be processed (if product has `usedfor: dashboard`)
+- ✅ Default behavior: Creates new subscription
+- ⚠️ Cannot add to existing subscription without `add_to_existing: true`
 
 ---
 
-## 🛠️ Step-by-Step Setup
+## Step-by-Step Setup
 
-### Step 1: Go to Stripe Dashboard
+### Step 1: Add Product Metadata
 
-1. Navigate to: https://dashboard.stripe.com/
-2. Go to **Products** → **Payment Links**
-3. Click on your payment link (or create a new one)
-
-### Step 2: Add Metadata
-
-1. Click **Settings** tab
-2. Scroll to **Metadata** section
-3. Click **Add metadata**
-4. Add:
-   - **Key:** `paymentby`
-   - **Value:** `directlink`
-5. Click **Add metadata** again
-6. Add:
-   - **Key:** `usecase`
-   - **Value:** `1`
+1. Go to **Stripe Dashboard** → **Products**
+2. Click on your product (Monthly or Yearly)
+3. Scroll to **Metadata** section
+4. Click **+ Add metadata**
+5. **Key:** `usedfor`
+6. **Value:** `dashboard`
 7. Click **Save**
 
-### Step 3: Verify
+**Repeat for both Monthly and Yearly products.**
 
-1. Test your payment link
-2. Check webhook logs
-3. Verify subscription is created (not added to existing)
+### Step 2: Create Payment Link
+
+1. Go to **Stripe Dashboard** → **Products**
+2. Click on your product
+3. Click **Payment Links** tab
+4. Click **+ Create payment link**
+5. Configure:
+   - **Price:** Select your price (monthly/yearly)
+   - **Mode:** Subscription (default)
+   - **Success URL:** `https://dashboard.consentbit.com/dashboard?session_id={CHECKOUT_SESSION_ID}`
+   - **Cancel URL:** `https://dashboard.consentbit.com/dashboard`
+6. **Custom Fields** (Optional):
+   - Add field: "Enter Your Live Domain" (if you want to collect site URL)
+7. Click **Create payment link**
+
+### Step 3: Test Payment Link
+
+1. Copy the Payment Link URL
+2. Open in browser
+3. Complete a test payment
+4. Check webhook logs to verify:
+   - Product metadata is detected
+   - Payment is processed correctly
+   - License is created
 
 ---
 
-## ✅ Verification Checklist
+## Webhook Processing Flow
 
-After adding metadata, verify:
+### When `checkout.session.completed` webhook fires:
 
-- [ ] Metadata added in Stripe Dashboard
-- [ ] `paymentby: 'directlink'` is set
-- [ ] `usecase: '1'` is set (optional but recommended)
-- [ ] Payment link creates new subscription (not adds to existing)
-- [ ] Webhook processes as Use Case 1
-- [ ] License keys are generated
+1. **Check Product Metadata:**
+   ```javascript
+   // Fetches subscription → items → price → product
+   const product = await fetchProduct(subscription.items[0].price.product);
+   if (product.metadata.usedfor !== 'dashboard') {
+     return; // Skip processing
+   }
+   ```
+
+2. **Check Session Metadata:**
+   ```javascript
+   // Reads metadata from checkout session
+   const paymentBy = session.metadata?.paymentby;
+   const addToExisting = session.metadata?.add_to_existing;
+   ```
+
+3. **Process Payment:**
+   - Creates license keys
+   - Saves to database
+   - Updates user dashboard
 
 ---
 
-## 🔍 Testing
+## Example: Complete Setup
 
-### Test Payment Link
+### Product Setup:
+```
+Product: ConsentBit Monthly
+Metadata:
+  - usedfor: dashboard
+```
 
-1. Use your payment link: `https://buy.stripe.com/test_xxxxx`
-2. Complete a test payment
-3. Check webhook logs for:
-   ```
-   [checkout.session.completed] Payment by: directlink
-   [checkout.session.completed] Use Case: 1
-   [checkout.session.completed] Creating new subscription...
-   ```
+### Payment Link Setup:
+```
+Payment Link: Monthly Subscription
+Product: ConsentBit Monthly
+Success URL: https://dashboard.consentbit.com/dashboard?session_id={CHECKOUT_SESSION_ID}
+Cancel URL: https://dashboard.consentbit.com/dashboard
+```
 
-### Check Metadata in Webhook
+### Result:
+- ✅ Payment Link creates subscription
+- ✅ Webhook checks product metadata (`usedfor: dashboard`)
+- ✅ Payment is processed
+- ✅ License is created
+- ✅ User sees license in dashboard
 
-In your webhook handler logs, you should see:
+---
+
+## Troubleshooting
+
+### Payment successful but no license created:
+
+1. **Check Product Metadata:**
+   - Go to Stripe Dashboard → Products
+   - Verify `usedfor: dashboard` is set
+
+2. **Check Webhook Logs:**
+   - Look for: `[USE CASE 1] 🏷️ Product metadata usedfor: ...`
+   - If you see: `⏭️ Skipping - Product usedfor is "...", not "dashboard"`
+   - → Product metadata is missing or incorrect
+
+3. **Check Webhook Events:**
+   - Go to Stripe Dashboard → Developers → Webhooks
+   - Click on your webhook endpoint
+   - Check if `checkout.session.completed` event was received
+
+### Payment Link not working:
+
+1. **Verify Product has Price:**
+   - Product must have at least one active price
+
+2. **Verify Webhook Endpoint:**
+   - URL: `https://consentbit-dashboard-test.web-8fb.workers.dev/webhook`
+   - Events: `checkout.session.completed` is selected
+
+3. **Check Success/Cancel URLs:**
+   - Must include `{CHECKOUT_SESSION_ID}` in success URL
+
+---
+
+## Use Case 1 Summary
+
+### ✅ Required:
+- **Product Metadata:** `usedfor: dashboard` (MANDATORY - webhook will skip without this)
+- **Payment Link Mode:** `subscription` (automatically detected as Use Case 1)
+
+### ⚠️ Optional:
+- **Payment Link Metadata:** `paymentby: directlink` (helps identify direct links)
+- **Session Metadata:** `add_to_existing: true/false` (for adding to existing subscription)
+- **Custom Field:** Site URL field (if collecting domain name)
+
+### 🎯 Key Points for Use Case 1:
+1. **No `usecase` metadata needed** - Use Case 1 is automatically detected from `mode: 'subscription'`
+2. **Product metadata is mandatory** - `usedfor: dashboard` must be set on the product
+3. **Subscription mode only** - Use Case 1 only works with subscription mode Payment Links
+4. **Metadata flows:** Product → Subscription → Webhook
+5. **Always test** after setting up metadata
+
+### 🔍 How Use Case 1 Differs from Other Use Cases:
+
+| Use Case | Mode | Metadata Required | How Identified |
+|----------|------|------------------|----------------|
+| **Use Case 1** | `subscription` | `usedfor: dashboard` (product) | Auto-detected from mode |
+| Use Case 2 | `payment` | `usecase: '2'` + `usedfor: dashboard` | Explicit metadata |
+| Use Case 3 | `payment` | `usecase: '3'` + `usedfor: dashboard` | Explicit metadata |
+
+---
+
+## Quick Reference
 
 ```javascript
-session.metadata = {
-  paymentby: 'directlink',
-  usecase: '1'
+// Product Metadata (REQUIRED)
+{
+  "usedfor": "dashboard"
+}
+
+// Payment Link Metadata (OPTIONAL)
+{
+  "paymentby": "directlink",
+  "add_to_existing": "false",
+  "existing_subscription_id": null
 }
 ```
 
 ---
 
-## 📚 Additional Configuration
+## Complete Metadata Reference
 
-### After Payment URLs (Required)
-
-You **MUST** configure where users are redirected after payment:
-
-**In Stripe Dashboard → Payment Link → Settings → After payment:**
-
-#### Success URL (After Successful Payment):
-```
-https://memberstack-login-test-713fa5.webflow.io/dashboard?session_id={CHECKOUT_SESSION_ID}
-```
-
-**Steps:**
-1. Go to **Settings** → **After payment**
-2. Under **Success page**, select **Custom URL**
-3. Enter: `https://memberstack-login-test-713fa5.webflow.io/dashboard?session_id={CHECKOUT_SESSION_ID}`
-4. **Important:** Keep `{CHECKOUT_SESSION_ID}` - Stripe will replace it with the actual session ID
-
-#### Cancel URL (If User Cancels):
-```
-https://memberstack-login-test-713fa5.webflow.io/dashboard
-```
-
-**Steps:**
-1. Under **Cancel page**, select **Custom URL**
-2. Enter: `https://memberstack-login-test-713fa5.webflow.io/dashboard`
-
-**Note:** The `{CHECKOUT_SESSION_ID}` placeholder is automatically replaced by Stripe with the actual checkout session ID.
-
-### Custom Field for Site Domain
-
-Direct payment links typically collect the site domain via a custom field:
-
-**In Stripe Dashboard → Payment Link → Custom fields:**
-
-- **Field type:** Text
-- **Field key:** `enteryourlivedomain`
-- **Label:** "Enter your live domain"
-- **Required:** Yes
-
-**Code automatically extracts this:**
-```javascript
-const siteUrlField = session.custom_fields.find(field => 
-  field.key === 'enteryourlivedomain'
-);
-```
-
----
-
-## 🎯 Summary
-
-### What to Add:
-
-1. ✅ **`paymentby: 'directlink'`** - Required
-2. ⚪ **`usecase: '1'`** - Optional but recommended
-
-### Where to Add:
-
-- **Stripe Dashboard** → **Payment Links** → **Your Link** → **Settings** → **Metadata**
-
-### Result:
-
-- ✅ Creates new subscription (Use Case 1)
-- ✅ Generates license keys
-- ✅ Processes site domain from custom field
-- ✅ Does NOT add to existing subscription
-
----
-
-## ❓ Troubleshooting
-
-### Problem: Payment adds to existing subscription instead of creating new
-
-**Solution:**
-- Verify `paymentby: 'directlink'` is set in metadata
-- Check that `add_to_existing` is NOT set to `'true'`
-- Ensure `existing_subscription_id` is NOT set
-
-### Problem: Metadata not appearing in webhook
-
-**Solution:**
-- Verify metadata is saved in Stripe Dashboard
-- Check that you're looking at `session.metadata` in webhook
-- Test with a new payment to ensure metadata is included
-
----
-
-That's it! Add `paymentby: 'directlink'` to your payment link metadata and you're done! 🎉
-
+For detailed metadata requirements for all use cases, see:
+- **[COMPLETE_METADATA_REFERENCE.md](./COMPLETE_METADATA_REFERENCE.md)** - Comprehensive guide covering all metadata for Use Case 1, 2, and 3

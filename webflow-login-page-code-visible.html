@@ -187,7 +187,9 @@ This uses Memberstack's passwordless API that sends a CODE to email (not magic l
             messageDiv.style.background = '';
             messageDiv.style.color = '';
             
-            const email = document.getElementById('passwordlessEmail').value.trim();
+            // Normalize email (lowercase, trim) to ensure consistency with Memberstack
+            const emailInput = document.getElementById('passwordlessEmail');
+            let email = emailInput.value.trim();
             
             if (!email) {
                 errorDiv.textContent = 'Please enter your email address';
@@ -207,13 +209,24 @@ This uses Memberstack's passwordless API that sends a CODE to email (not magic l
                 return;
             }
             
+            // Normalize email to lowercase (Memberstack stores emails in lowercase)
+            email = email.toLowerCase().trim();
+            
+            // Update input field with normalized email (so user sees what was sent)
+            emailInput.value = email;
+            
+            console.log('[Webflow Login] Sending passwordless code to:', email);
+            
             try {
                 
                 // Use Memberstack's passwordless API
-                await memberstack.sendMemberLoginPasswordlessEmail({
+                // IMPORTANT: Use normalized email to match Memberstack storage
+                const response = await memberstack.sendMemberLoginPasswordlessEmail({
                     email: email,
                     redirectUrl: dashboardUrl
                 });
+                
+                console.log('[Webflow Login] ✅ Passwordless email sent successfully:', response);
                 
                 isEmailSent = true;
                 messageDiv.textContent = '✅ Check your email for the login code';
@@ -238,8 +251,29 @@ This uses Memberstack's passwordless API that sends a CODE to email (not magic l
                     messageDiv.style.display = 'none';
                 }, 60000);
             } catch (error) {
-                console.error('[Webflow Login] Error sending passwordless email:', error);
-                errorDiv.textContent = error.message || "Couldn't send login code. Please try again.";
+                console.error('[Webflow Login] ❌ Error sending passwordless email:', error);
+                console.error('[Webflow Login] Error details:', {
+                    message: error.message,
+                    stack: error.stack,
+                    email: email
+                });
+                
+                // Provide more specific error messages
+                let errorMessage = "Couldn't send login code. Please try again.";
+                if (error.message) {
+                    const errorMsgLower = error.message.toLowerCase();
+                    if (errorMsgLower.includes('not found') || errorMsgLower.includes('does not exist') || errorMsgLower.includes('member not found')) {
+                        errorMessage = 'Account not found. Please sign up first or contact support.';
+                    } else if (errorMsgLower.includes('rate limit') || errorMsgLower.includes('too many')) {
+                        errorMessage = 'Too many requests. Please wait a moment and try again.';
+                    } else if (errorMsgLower.includes('invalid email')) {
+                        errorMessage = 'Invalid email address. Please check and try again.';
+                    } else {
+                        errorMessage = error.message || errorMessage;
+                    }
+                }
+                
+                errorDiv.textContent = errorMessage;
                 errorDiv.style.display = 'block';
                 button.disabled = false;
                 button.textContent = 'Send Login Code';
@@ -260,31 +294,116 @@ This uses Memberstack's passwordless API that sends a CODE to email (not magic l
                 return;
             }
             
+            // Validate code format (should be 6 digits)
+            if (code.length !== 6 || !/^\d+$/.test(code)) {
+                errorDiv.textContent = 'Please enter a valid 6-digit code';
+                errorDiv.style.display = 'block';
+                return;
+            }
+            
             verifyCodeButton.disabled = true;
             verifyCodeButton.textContent = 'Verifying...';
             errorDiv.style.display = 'none';
             
+            // Normalize email (lowercase, trim) to match Memberstack storage
+            const emailInput = document.getElementById('passwordlessEmail');
+            const email = emailInput.value.trim().toLowerCase();
+            
+            console.log('[Webflow Login] Verifying code for email:', email);
+            console.log('[Webflow Login] Code length:', code.length);
+            
             try {
+                // Method 1: Try with email and code (most common)
+                let member = null;
+                let verificationError = null;
                 
-                // Try to verify the code
-                // Note: Memberstack might use different methods - adjust based on their API
-                const member = await memberstack.loginMemberPasswordless({
-                    passwordlessToken: code,
-                    email: document.getElementById('passwordlessEmail').value.trim()
-                });
+                try {
+                    console.log('[Webflow Login] Attempting loginMemberPasswordless with email and code...');
+                    member = await memberstack.loginMemberPasswordless({
+                        passwordlessToken: code,
+                        email: email
+                    });
+                    console.log('[Webflow Login] ✅ Verification successful with email');
+                } catch (error1) {
+                    console.warn('[Webflow Login] Method 1 failed:', error1.message);
+                    verificationError = error1;
+                    
+                    // Method 2: Try with just the code (some Memberstack versions don't need email)
+                    try {
+                        console.log('[Webflow Login] Attempting loginMemberPasswordless with code only...');
+                        member = await memberstack.loginMemberPasswordless({
+                            passwordlessToken: code
+                        });
+                        console.log('[Webflow Login] ✅ Verification successful without email');
+                    } catch (error2) {
+                        console.warn('[Webflow Login] Method 2 failed:', error2.message);
+                        verificationError = error2;
+                        
+                        // Method 3: Try alternative method name (some SDK versions)
+                        try {
+                            if (memberstack.verifyPasswordlessCode && typeof memberstack.verifyPasswordlessCode === 'function') {
+                                console.log('[Webflow Login] Attempting verifyPasswordlessCode...');
+                                member = await memberstack.verifyPasswordlessCode({
+                                    token: code,
+                                    email: email
+                                });
+                                console.log('[Webflow Login] ✅ Verification successful with verifyPasswordlessCode');
+                            } else {
+                                throw new Error('No alternative verification method available');
+                            }
+                        } catch (error3) {
+                            console.error('[Webflow Login] All verification methods failed');
+                            throw verificationError || error3;
+                        }
+                    }
+                }
+                
+                // Check if member was returned
+                if (!member) {
+                    throw new Error('Verification succeeded but no member data returned');
+                }
+                
+                console.log('[Webflow Login] ✅ Member verified:', member);
+                
+                // Verify we can extract email from member
+                const memberEmail = member.email || member._email || (member.data && (member.data.email || member.data.auth?.email)) || email;
+                console.log('[Webflow Login] Member email:', memberEmail);
                 
                 messageDiv.textContent = '✅ Login successful! Redirecting...';
                 messageDiv.style.background = '#e8f5e9';
                 messageDiv.style.color = '#2e7d32';
                 
+                // Wait a moment for session to be established
+                await new Promise(resolve => setTimeout(resolve, 500));
+                
                 // Redirect to dashboard
-                setTimeout(() => {
-                    window.location.href = dashboardUrl;
-                }, 1000);
+                window.location.href = dashboardUrl;
                 
             } catch (error) {
-                console.error('[Webflow Login] Code verification failed:', error);
-                errorDiv.textContent = error.message || 'Invalid code. Please try again.';
+                console.error('[Webflow Login] ❌ Code verification failed:', error);
+                console.error('[Webflow Login] Error details:', {
+                    message: error.message,
+                    stack: error.stack,
+                    email: email,
+                    codeLength: code.length
+                });
+                
+                // Provide more specific error messages
+                let errorMessage = 'Invalid code. Please try again.';
+                if (error.message) {
+                    const errorMsgLower = error.message.toLowerCase();
+                    if (errorMsgLower.includes('expired') || errorMsgLower.includes('timeout')) {
+                        errorMessage = 'Code has expired. Please request a new code.';
+                    } else if (errorMsgLower.includes('invalid') || errorMsgLower.includes('incorrect')) {
+                        errorMessage = 'Invalid code. Please check and try again.';
+                    } else if (errorMsgLower.includes('not found') || errorMsgLower.includes('does not exist')) {
+                        errorMessage = 'Account not found. Please sign up first.';
+                    } else {
+                        errorMessage = error.message;
+                    }
+                }
+                
+                errorDiv.textContent = errorMessage;
                 errorDiv.style.display = 'block';
                 codeInput.value = '';
                 codeInput.focus();
@@ -295,7 +414,9 @@ This uses Memberstack's passwordless API that sends a CODE to email (not magic l
         
         // Resend code handler
         resendCodeButton.addEventListener('click', async () => {
-            const email = document.getElementById('passwordlessEmail').value.trim();
+            // Normalize email (lowercase, trim) to ensure consistency
+            const emailInput = document.getElementById('passwordlessEmail');
+            let email = emailInput.value.trim().toLowerCase();
             
             if (!email) {
                 errorDiv.textContent = 'Email is required';
@@ -303,11 +424,17 @@ This uses Memberstack's passwordless API that sends a CODE to email (not magic l
                 return;
             }
             
+            // Update input field with normalized email
+            emailInput.value = email;
+            
             resendCodeButton.disabled = true;
             resendCodeButton.textContent = 'Resending...';
             errorDiv.style.display = 'none';
             
+            console.log('[Webflow Login] Resending passwordless code to:', email);
+            
             try {
+                // IMPORTANT: Use normalized email to match Memberstack storage
                 await memberstack.sendMemberLoginPasswordlessEmail({
                     email: email,
                     redirectUrl: dashboardUrl

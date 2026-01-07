@@ -21,7 +21,7 @@ The `/purchase-quantity` endpoint now reads pricing configuration from environme
 | Variable | Description | Example | Required |
 |----------|-------------|---------|----------|
 | `YEARLY_PRODUCT_ID` | Stripe Product ID for yearly licenses | `prod_TiX0CF9K1RSRyb` | ✅ Yes |
-| `YEARLY_UNIT_AMOUNT` | Price per license in cents | `7200` (for $72.00) | ⚠️ Optional (defaults to 7200) |
+| `YEARLY_UNIT_AMOUNT` | Price per license in cents | `7500` (for $75.00) | ⚠️ Optional (defaults to 7500) |
 | `YEARLY_CURRENCY` | Currency code | `usd` | ⚠️ Optional (defaults to 'usd') |
 
 **Alternative variable names (for backward compatibility):**
@@ -49,7 +49,7 @@ MONTHLY_UNIT_AMOUNT = "800"
 MONTHLY_CURRENCY = "usd"
 
 YEARLY_PRODUCT_ID = "prod_TiX0CF9K1RSRyb"
-YEARLY_UNIT_AMOUNT = "7200"
+YEARLY_UNIT_AMOUNT = "7500"
 YEARLY_CURRENCY = "usd"
 ```
 
@@ -75,7 +75,7 @@ wrangler secret put YEARLY_PRODUCT_ID
 # Enter: prod_TiX0CF9K1RSRyb
 
 wrangler secret put YEARLY_UNIT_AMOUNT
-# Enter: 7200
+# Enter: 7500
 ```
 
 ---
@@ -92,7 +92,7 @@ MONTHLY_CURRENCY=usd
 
 # Yearly
 YEARLY_PRODUCT_ID=prod_TiX0CF9K1RSRyb
-YEARLY_UNIT_AMOUNT=7200      # $72.00 per license
+YEARLY_UNIT_AMOUNT=7500      # $75.00 per license
 YEARLY_CURRENCY=usd
 ```
 
@@ -107,10 +107,10 @@ With the current configuration:
 - 5 licenses = 800 × 5 = 4000 cents = **$40.00**
 - 10 licenses = 800 × 10 = 8000 cents = **$80.00**
 
-**Yearly ($72.00 per license):**
-- 1 license = 7200 × 1 = 7200 cents = **$72.00**
-- 5 licenses = 7200 × 5 = 36000 cents = **$360.00**
-- 10 licenses = 7200 × 10 = 72000 cents = **$720.00**
+**Yearly ($75.00 per license):**
+- 1 license = 7500 × 1 = 7500 cents = **$75.00**
+- 5 licenses = 7500 × 5 = 37500 cents = **$375.00**
+- 10 licenses = 7500 × 10 = 75000 cents = **$750.00**
 
 ---
 

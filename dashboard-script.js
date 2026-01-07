@@ -1670,13 +1670,20 @@
             if (!response.ok) {
                 const errorText = await response.text();
                 console.error('[Dashboard] ❌ API Error:', response.status, errorText);
+                console.error('[Dashboard] ❌ Request URL:', `${API_BASE}/dashboard?${params.toString()}`);
+                console.error('[Dashboard] ❌ User Email:', userEmail);
                 
                 if (response.status === 401) {
-                    throw new Error('Not authenticated');
+                    console.error('[Dashboard] ❌ Authentication failed - user may not be logged in');
+                    throw new Error('Not authenticated. Please log in again.');
                 } else if (response.status === 404) {
+                    console.error('[Dashboard] ❌ User data not found for email:', userEmail);
                     throw new Error('User data not found for this email');
+                } else if (response.status === 500) {
+                    console.error('[Dashboard] ❌ Server error - backend may be having issues');
+                    throw new Error('Server error. Please try again later.');
                 }
-                throw new Error(`Failed to load dashboard: ${response.status}`);
+                throw new Error(`Failed to load dashboard: ${response.status} - ${errorText.substring(0, 100)}`);
             }
             
             const data = await response.json();
@@ -2153,17 +2160,43 @@
         } catch (error) {
             console.error('[Dashboard] ❌ Error loading dashboard:', error);
             console.error('[Dashboard] Error details:', error.message);
+            console.error('[Dashboard] Error stack:', error.stack);
+            console.error('[Dashboard] User email:', userEmail);
+            console.error('[Dashboard] API Base URL:', API_BASE);
+            
+            let errorMessage = error.message || 'Unknown error';
+            let userFriendlyMessage = 'Failed to load dashboard data.';
+            
+            // Provide more specific error messages
+            if (errorMessage.includes('Not authenticated') || errorMessage.includes('401')) {
+                userFriendlyMessage = 'You are not logged in. Please log in and try again.';
+            } else if (errorMessage.includes('404')) {
+                userFriendlyMessage = 'User data not found. Please contact support.';
+            } else if (errorMessage.includes('500') || errorMessage.includes('Server error')) {
+                userFriendlyMessage = 'Server error. Please try again in a few moments.';
+            } else if (errorMessage.includes('timeout')) {
+                userFriendlyMessage = 'Request timed out. Please check your internet connection and try again.';
+            } else if (errorMessage.includes('Failed to fetch') || errorMessage.includes('NetworkError')) {
+                userFriendlyMessage = 'Network error. Please check your internet connection.';
+            }
             
             const errorMsg = `<div style="text-align: center; padding: 40px; color: #f44336;">
-                <p>Failed to load dashboard data.</p>
-                <p style="font-size: 12px; margin-top: 10px;">Error: ${error.message}</p>
-                <p style="font-size: 12px;">Email used: ${userEmail}</p>
-                <p style="font-size: 12px;">Please refresh the page or contact support.</p>
+                <p style="font-weight: bold; font-size: 16px; margin-bottom: 10px;">${userFriendlyMessage}</p>
+                <p style="font-size: 12px; margin-top: 10px; color: #666;">Error: ${errorMessage}</p>
+                <p style="font-size: 12px; color: #666;">Email used: ${userEmail || 'Not available'}</p>
+                <p style="font-size: 12px; color: #666; margin-top: 20px;">
+                    <button onclick="location.reload()" style="padding: 8px 16px; background: #1976d2; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                        Refresh Page
+                    </button>
+                </p>
             </div>`;
             
             if (domainsContainer) domainsContainer.innerHTML = errorMsg;
             if (subscriptionsContainer) subscriptionsContainer.innerHTML = errorMsg;
             if (sitesContainer) sitesContainer.innerHTML = errorMsg;
+            
+            // Also show error notification
+            showError(userFriendlyMessage);
         }
     }
     
@@ -6665,10 +6698,18 @@
         // User is logged in - ensure dashboard is visible
         
         // Extract email from member object (check multiple locations)
+        // IMPORTANT: Check all possible email locations including auth.email
         let userEmail = member.normalizedEmail || 
                        member.email || 
                        member._email ||
-                       (member.data && (member.data.email || member.data.auth?.email)) ||
+                       member.auth?.email ||
+                       member.auth?._email ||
+                       (member.data && (
+                           member.data.email || 
+                           member.data._email ||
+                           member.data.auth?.email ||
+                           member.data.auth?._email
+                       )) ||
                        '';
         
         // Normalize email
@@ -6679,6 +6720,13 @@
         if (!userEmail) {
             console.error('[Dashboard] ❌ No email found in member object!');
             console.error('[Dashboard] Member object structure:', JSON.stringify(member, null, 2));
+            console.error('[Dashboard] Checking all possible email locations:');
+            console.error('[Dashboard]   - member.normalizedEmail:', member.normalizedEmail);
+            console.error('[Dashboard]   - member.email:', member.email);
+            console.error('[Dashboard]   - member._email:', member._email);
+            console.error('[Dashboard]   - member.auth?.email:', member.auth?.email);
+            console.error('[Dashboard]   - member.data?.email:', member.data?.email);
+            console.error('[Dashboard]   - member.data?.auth?.email:', member.data?.auth?.email);
             showError('Unable to retrieve user email. Please log out and log in again.');
             // Still show dashboard but with error
             const dashboardContainerError = document.getElementById('dashboard-container');
@@ -6688,6 +6736,8 @@
             }
             return;
         }
+        
+        console.log('[Dashboard] ✅ Email extracted successfully:', userEmail);
         
         // Update email display in header
         updateUserEmailDisplay(userEmail);

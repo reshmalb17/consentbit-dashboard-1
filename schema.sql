@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS payments (
   magic_link TEXT,
   magic_link_generated INTEGER DEFAULT 0,
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
 );
 
 -- Sites table - stores detailed site information including renewal dates and amounts
@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS sites (
   cancel_at_period_end INTEGER DEFAULT 0,
   canceled_at INTEGER,
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  platform TEXT  DEFAULT 'pending'  
+
 );
 
 -- Licenses table - license_key is the primary identifier
@@ -48,7 +50,8 @@ CREATE TABLE IF NOT EXISTS licenses (
   status TEXT NOT NULL DEFAULT 'active',
   purchase_type TEXT DEFAULT 'site',  -- 'site' or 'quantity'
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  platform TEXT  DEFAULT 'pending'  
 );
 
 -- REMOVED: Magic Link Tokens table - Not needed (Memberstack handles login)

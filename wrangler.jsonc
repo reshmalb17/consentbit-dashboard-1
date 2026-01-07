@@ -5,7 +5,7 @@
 	"vars": {
 		"DEFAULT_PRICE_ID": "price_1ShWWXSAczuHLTOtbNqhSk5n",
 		"BASE_URL": "https://consentbit-dashboard-test.web-8fb.workers.dev",
-		"MEMBERSTACK_REDIRECT_URL": "https://memberstack-login-test-713fa5.webflow.io/dashboard"
+		"MEMBERSTACK_REDIRECT_URL": "https://dashboard.consentbit.com/dashboard"
 	},
 	"d1_databases": [
 		{
@@ -22,6 +22,14 @@
 		{
 			"binding": "SUBSCRIPTION_CONSENTBIT",
 			"id": "c46f2faa3cf74039ac7207bdb20ad8fa"
+		},
+		{
+			"binding": "ACTIVE_SITES_CONSENTBIT_FRAMER",
+			"id": "f89c8bbb2dd843b8aebf30a745723a2c"
+		},
+			{
+			"binding": "Pending_Active_site",
+			"id": "041162eac7954bb18de330676df858bf"
 		}
 	],
 	"triggers": {
