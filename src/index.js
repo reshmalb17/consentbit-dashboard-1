@@ -291,11 +291,11 @@ async function processSitesQueue(env, limit = 100) {
 							`
               INSERT INTO licenses (
                 license_key, customer_id, subscription_id, item_id, site_domain,
-                status, purchase_type, billing_period, created_at, updated_at
-              ) VALUES (?, ?, ?, ?, ?, 'active', 'site', ?, ?, ?)
+                status, purchase_type, billing_period, created_at, updated_at,user_email
+              ) VALUES (?, ?, ?, ?, ?, 'active', 'site', ?, ?, ?,?)
             `
 						)
-							.bind(licenseKey, customerId, sub.id, itemId, siteName, billingPeriod, licenseTimestamp, licenseTimestamp)
+							.bind(licenseKey, customerId, sub.id, itemId, siteName, billingPeriod, licenseTimestamp, licenseTimestamp, userEmail)
 							.run();
 
 						// Save subscription to database
@@ -469,14 +469,14 @@ async function saveLicenseKeyToKVPlatform(
 function getPriceIdFromProduct(productId, billingPeriod, env) {
 	const period = (billingPeriod || '').toLowerCase().trim();
 
-	// prod_SHWZdF20XLXtn9 = monthly product
-	if (productId === 'prod_SHWZdF20XLXtn9' && period === 'monthly') {
-		return env.MONTHLY_LICENSE_PRICE_ID; // used for both quantity + sites
+	// prod_TiG3c1jjtQHRLK = monthly product
+	if (productId === 'prod_TiG3c1jjtQHRLK' && period === 'monthly') {
+		return "price_1SkpXkJwcuG9163MTm9SU4Uf" || env.MONTHLY_LICENSE_PRICE_ID; // used for both quantity + sites
 	}
 
-	// prod_SJQgqC8uDgRcOi = yearly product
-	if (productId === 'prod_SJQgqC8uDgRcOi' && period === 'yearly') {
-		return env.YEARLY_LICENSE_PRICE_ID; // used for both quantity + sites
+	// prod_TiG4YkK61hiKKR = yearly product
+	if (productId === 'prod_TiG4YkK61hiKKR' && period === 'yearly') {
+		return "price_1SkpYoJwcuG9163MwT7oFyRf" ||env.YEARLY_LICENSE_PRICE_ID; // used for both quantity + sites
 	}
 
 	return null;
@@ -697,12 +697,12 @@ async function handleCreateSiteCheckout(request, env) {
 	let productId, unitAmount;
 	const currency = 'usd'; // Default to USD
 	if (normalizedPeriod === 'monthly') {
-		productId = env.MONTHLY_PRODUCT_ID || env.MONTHLY_LICENSE_PRODUCT_ID || 'prod_SHWZdF20XLXtn9';
+		productId = env.MONTHLY_PRODUCT_ID || env.MONTHLY_LICENSE_PRODUCT_ID || 'prod_TiG3c1jjtQHRLK';
 		unitAmount = parseInt(env.MONTHLY_UNIT_AMOUNT || env.MONTHLY_LICENSE_UNIT_AMOUNT || '800');
 		console.log('[CREATE-SITE-CHECKOUT] 💰 Monthly config:', { productId, unitAmount, currency });
 	} else if (normalizedPeriod === 'yearly') {
-		productId = env.YEARLY_PRODUCT_ID || env.YEARLY_LICENSE_PRODUCT_ID || 'prod_SJQgqC8uDgRcOi';
-		unitAmount = parseInt(env.YEARLY_UNIT_AMOUNT || env.YEARLY_LICENSE_UNIT_AMOUNT || '7500');
+		productId = env.YEARLY_PRODUCT_ID || env.YEARLY_LICENSE_PRODUCT_ID || 'prod_TiG4YkK61hiKKR';
+		unitAmount = parseInt(env.YEARLY_UNIT_AMOUNT || env.YEARLY_LICENSE_UNIT_AMOUNT || '7200');
 		console.log('[CREATE-SITE-CHECKOUT] 💰 Yearly config:', { productId, unitAmount, currency });
 	} else {
 		console.log('[CREATE-SITE-CHECKOUT] ❌ Invalid billing period:', billingPeriodParam);
@@ -861,51 +861,85 @@ function generateRandomPassword() {
 }
 
 // Helper to get CORS headers with proper origin handling
+// function getCorsHeaders(request) {
+// 	const origin = request.headers.get('Origin');
+// 	const allowedOrigins = [
+// 		'https://memberstack-login-test-713fa5.webflow.io',
+// 		'https://consentbit-dashboard-test.web-8fb.workers.dev',
+// 		'http://localhost:3000',
+// 		'http://localhost:3001',
+// 		'http://localhost:8080',
+// 		'http://localhost:1337',
+// 		'http://localhost:5173',
+// 		'http://localhost:5174',
+// 		'http://localhost:5175',
+// 		'https://dashboard.consentbit.com', // <- removed trailing slash
+// 	];
+
+// 	const headers = {};
+
+// 	if (origin && allowedOrigins.includes(origin)) {
+// 		headers['Access-Control-Allow-Origin'] = origin;
+// 		headers['Access-Control-Allow-Credentials'] = 'true';
+// 		headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+// 		headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';
+// 		headers['Vary'] = 'Origin';
+// 	}
+
+// 	return headers;
+// }
+
+// function jsonResponse(status, body, cors = true, request = null) {
+// 	const headers = { 'content-type': 'application/json' };
+// 	if (cors) {
+// 		if (request) {
+// 			const corsHeaders = getCorsHeaders(request);
+// 			Object.assign(headers, corsHeaders);
+// 		} else {
+// 			headers['Access-Control-Allow-Origin'] = '*';
+// 			headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+// 			headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';
+// 		}
+// 	}
+// 	return new Response(JSON.stringify(body), {
+// 		status,
+// 		headers,
+// 	});
+// }
+// Final recommended code
 function getCorsHeaders(request) {
-	const origin = request.headers.get('Origin');
-	const allowedOrigins = [
-		'https://memberstack-login-test-713fa5.webflow.io',
-		'https://consentbit-dashboard-test.web-8fb.workers.dev',
-		'http://localhost:3000',
-		'http://localhost:3001',
-		'http://localhost:8080',
-		'http://localhost:1337',
-		'http://localhost:5173',
-		'http://localhost:5174',
-		'http://localhost:5175',
-		'https://dashboard.consentbit.com', // <- removed trailing slash
-	];
+    const origin = request.headers.get('Origin');
+    
+    const headers = {
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, stripe-signature, cookie',
+    };
 
-	const headers = {};
+    if (origin) {
+        headers['Access-Control-Allow-Origin'] = origin;
+        headers['Access-Control-Allow-Credentials'] = 'true';
+        headers['Vary'] = 'Origin';
+    } else {
+        headers['Access-Control-Allow-Origin'] = '*';
+    }
 
-	if (origin && allowedOrigins.includes(origin)) {
-		headers['Access-Control-Allow-Origin'] = origin;
-		headers['Access-Control-Allow-Credentials'] = 'true';
-		headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
-		headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';
-		headers['Vary'] = 'Origin';
-	}
-
-	return headers;
+    return headers;
 }
 
 function jsonResponse(status, body, cors = true, request = null) {
-	const headers = { 'content-type': 'application/json' };
-	if (cors) {
-		if (request) {
-			const corsHeaders = getCorsHeaders(request);
-			Object.assign(headers, corsHeaders);
-		} else {
-			headers['Access-Control-Allow-Origin'] = '*';
-			headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
-			headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';
-		}
-	}
-	return new Response(JSON.stringify(body), {
-		status,
-		headers,
-	});
+    const headers = { 'content-type': 'application/json' };
+    
+    if (cors) {
+        const corsHeaders = getCorsHeaders(request);
+        Object.assign(headers, corsHeaders);
+    }
+    
+    return new Response(JSON.stringify(body), {
+        status,
+        headers,
+    });
 }
+
 
 function getEnvVar(env, key) {
 	if (!env[key]) throw new Error(`Missing env var ${key}`);
@@ -2077,8 +2111,8 @@ async function saveLicenseKeyToKV(
 	siteName = null
 ) {
 	try {
-		if (!env.ACTIVE_SITES_CONSENTBIT) {
-			console.warn('[KV] ACTIVE_SITES_CONSENTBIT namespace not configured, skipping KV storage');
+		if (!env.UN_ASSIGNED_LICENSE_KEYS) {
+			console.warn('[KV] UN_ASSIGNED_LICENSE_KEYS namespace not configured, skipping KV storage');
 			return;
 		}
 
@@ -2094,38 +2128,38 @@ async function saveLicenseKeyToKV(
 			cancelAtPeriodEnd: cancelAtPeriodEnd,
 		};
 
-		// If site name is provided (license key is activated), use connectDomain as the KV key
-		if (siteName) {
-			const formattedSiteName = formatSiteName(siteName);
-			if (formattedSiteName) {
-				activeSitesData.connectDomain = formattedSiteName;
+		// // If site name is provided (license key is activated), use connectDomain as the KV key
+		// if (siteName) {
+		// 	const formattedSiteName = formatSiteName(siteName);
+		// 	if (formattedSiteName) {
+		// 		activeSitesData.connectDomain = formattedSiteName;
 
-				// Use connectDomain as the KV key instead of license key
-				await env.ACTIVE_SITES_CONSENTBIT.put(formattedSiteName, JSON.stringify(activeSitesData));
-				console.log(`[KV] ✅ Saved license key to ACTIVE_SITES_CONSENTBIT with key: ${formattedSiteName} (connectDomain)`);
+		// 		// Use connectDomain as the KV key instead of license key
+		// 		await env.ACTIVE_SITES_CONSENTBIT.put(formattedSiteName, JSON.stringify(activeSitesData));
+		// 		console.log(`[KV] ✅ Saved license key to ACTIVE_SITES_CONSENTBIT with key: ${formattedSiteName} (connectDomain)`);
 
-				// Delete old KV entry if it was keyed by license key (for backward compatibility)
-				// Note: This is a safety check - the activate-license endpoint also deletes old entries
-				try {
-					const oldEntry = await env.ACTIVE_SITES_CONSENTBIT.get(licenseKey);
-					if (oldEntry) {
-						await env.ACTIVE_SITES_CONSENTBIT.delete(licenseKey);
-						console.log(`[KV] 🗑️ Deleted old KV entry keyed by license key: ${licenseKey}`);
-					}
-				} catch (deleteErr) {
-					// Entry might not exist or already deleted - that's okay
-					// Non-critical, continue
-				}
-			} else {
-				// If formatting failed, fall back to license key as the key
-				await env.ACTIVE_SITES_CONSENTBIT.put(licenseKey, JSON.stringify(activeSitesData));
-				console.log(`[KV] ✅ Saved license key to ACTIVE_SITES_CONSENTBIT with key: ${licenseKey} (fallback)`);
-			}
-		} else {
+		// 		// Delete old KV entry if it was keyed by license key (for backward compatibility)
+		// 		// Note: This is a safety check - the activate-license endpoint also deletes old entries
+		// 		try {
+		// 			const oldEntry = await env.ACTIVE_SITES_CONSENTBIT.get(licenseKey);
+		// 			if (oldEntry) {
+		// 				await env.ACTIVE_SITES_CONSENTBIT.delete(licenseKey);
+		// 				console.log(`[KV] 🗑️ Deleted old KV entry keyed by license key: ${licenseKey}`);
+		// 			}
+		// 		} catch (deleteErr) {
+		// 			// Entry might not exist or already deleted - that's okay
+		// 			// Non-critical, continue
+		// 		}
+		// 	} else {
+		// 		// If formatting failed, fall back to license key as the key
+		// 		await env.ACTIVE_SITES_CONSENTBIT.put(licenseKey, JSON.stringify(activeSitesData));
+		// 		console.log(`[KV] ✅ Saved license key to ACTIVE_SITES_CONSENTBIT with key: ${licenseKey} (fallback)`);
+		// 	}
+		// } else {
 			// If no site name, use license key as the key (license not activated yet)
-			await env.ACTIVE_SITES_CONSENTBIT.put(licenseKey, JSON.stringify(activeSitesData));
+			await env.UN_ASSIGNED_LICENSE_KEYS.put(licenseKey, JSON.stringify(activeSitesData));
 			console.log(`[KV] ✅ Saved license key to ACTIVE_SITES_CONSENTBIT with key: ${licenseKey} (not activated)`);
-		}
+		// }
 	} catch (error) {
 		console.error('[KV] ❌ Error saving license key to KV storage:', error);
 		// Don't throw - KV storage is optional, don't fail the main operation
@@ -2418,8 +2452,8 @@ async function processQueueItem(env, queueItem) {
 			try {
 				const insertResult = await env.DB.prepare(
 					`INSERT INTO licenses 
-           (license_key, customer_id, subscription_id, item_id, site_domain, used_site_domain, status, purchase_type, billing_period, renewal_date, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           (license_key, customer_id, subscription_id, item_id, site_domain, used_site_domain, status, purchase_type, billing_period, renewal_date, created_at, updated_at,user_email)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						license_key,
@@ -2433,7 +2467,8 @@ async function processQueueItem(env, queueItem) {
 						billingPeriod,
 						renewalDate,
 						timestamp,
-						timestamp
+						timestamp,
+						user_email
 					)
 					.run();
 
@@ -2448,6 +2483,7 @@ async function processQueueItem(env, queueItem) {
 						billing_period: billingPeriod,
 						renewal_date: renewalDate ? new Date(renewalDate * 1000).toISOString() : null,
 						created_at: new Date(timestamp * 1000).toISOString(),
+						user_email: user_email
 					});
 
 					// Verify the license was saved correctly
@@ -3482,6 +3518,7 @@ export default {
 
 
 
+	const licenseKey1 = await generateUniqueLicenseKey(env);
 
 
               //DETECTING PLATFORM FROM METADATA STARTS
@@ -3573,7 +3610,7 @@ export default {
 									const normalizedEmail = email.toLowerCase().trim();
 
 									console.log('[USE CASE 1] 💾 Saving site details to database...');
-
+								
 									// Ensure all values are defined, provide fallback if Stripe subscription data missing
 									const currentPeriodStart = sub.current_period_start ?? now;
 									const currentPeriodEnd = sub.current_period_end ?? now + 30 * 24 * 60 * 60; // +30 days fallback
@@ -3582,7 +3619,8 @@ export default {
 
 									const response = await env.DB.prepare(
 										`INSERT INTO sites 
-        (subscription_id,
+        (
+		subscription_id,
          customer_id, 
          site_domain, 
          price_id,
@@ -3594,8 +3632,11 @@ export default {
          canceled_at,
          platform,
          currency,
-         amount_paid)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?,?)`
+         amount_paid,
+		 license_key,
+		 user_email,
+		 billing_period)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?,?,?, ?,?)`
 									)
 										.bind(
 											sub.id,
@@ -3610,7 +3651,10 @@ export default {
 											canceledAt,
 											platform,
 											'usd',
-											amountPaid // platform
+											amountPaid ,
+											licenseKey1,
+											normalizedEmail,
+											billingPeriods
 										)
 										.run();
 
@@ -3654,21 +3698,33 @@ export default {
 							// STEP 10: Generate License Key
 							// ========================================
 							try {
-								const licenseKey = await generateUniqueLicenseKey(env);
+							//	const licenseKey = await generateUniqueLicenseKey(env);
 								const now = Math.floor(Date.now() / 1000);
 								const normalizedEmail = email.toLowerCase().trim();
-
-								console.log('[USE CASE 1] 🔑 Generated license key:', licenseKey.substring(0, 10) + '...');
+									   console.log('[USE CASE 1] 🔍 email to save...', normalizedEmail);
+								console.log('[USE CASE 1] 🔑 Generated license key:', licenseKey1.substring(0, 10) + '...');
 
 								const response = await env.DB.prepare(
 									`
   INSERT INTO licenses 
-  (license_key, subscription_id, customer_id, item_id, site_domain, status, used_site_domain, purchase_type, created_at, updated_at, platform)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  (
+  license_key, 
+  subscription_id,
+  customer_id,
+   item_id,
+    site_domain, 
+	status,
+	 used_site_domain,
+	  purchase_type,
+	   created_at, 
+	   updated_at,
+	    platform,
+		user_email)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 								)
 									.bind(
-										licenseKey,
+										licenseKey1,
 										sub.id,
 										customerId,
 										null,
@@ -3678,7 +3734,8 @@ export default {
 										'site',
 										now,
 										now,
-										platform
+										platform,
+										normalizedEmail
 									)
 									.run();
 								console.log('[USE CASE 1] ✅ [LICENSES] License key saved:', response);
@@ -5301,10 +5358,10 @@ export default {
 										await env.DB.prepare(
 											`INSERT INTO licenses 
                              (license_key, customer_id, subscription_id, item_id, 
-            status, purchase_type, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            status, purchase_type, created_at, updated_at,user_email)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 										)
-											.bind(l.licenseKey, useCase3CustomerId, l.subscriptionId, l.itemId, 'active', 'quantity', ts, ts)
+											.bind(l.licenseKey, useCase3CustomerId, l.subscriptionId, l.itemId, 'active', 'quantity', ts, ts,userEmail)
 											.run();
 
 										await saveLicenseKeyToKV(env, l.licenseKey, useCase3CustomerId, l.subscriptionId, userEmail, 'complete', false, null);
@@ -5536,181 +5593,187 @@ export default {
 					}
 
 					// Handle invoice.payment_succeeded - generate license keys (if not already done)
-					if (event.type === 'invoice.payment_succeeded') {
-						const invoice = event.data.object;
-						const subscriptionId = invoice.subscription;
-						const customerId = invoice.customer;
+// 					if (event.type === 'invoice.payment_succeeded') {
+// 						console.log('[[[[[Handling invoice.payment_succeeded event]]]]]');
+// 						const invoice = event.data.object;
+// 						const subscriptionId = invoice.subscription;
+// 						const customerId = invoice.customer;
+                       
+// 						// Check product metadata to verify it's for dashboard
+// 						if (subscriptionId) {
+// 							try {
+// 								const subRes = await stripeFetch(env, `/subscriptions/${subscriptionId}`);
+// 								if (subRes.status === 200 && subRes.body?.items?.data?.length > 0) {
+// 									const firstItem = subRes.body.items.data[0];
+// 									if (firstItem.price && firstItem.price.product) {
+// 										const productId = typeof firstItem.price.product === 'string' ? firstItem.price.product : firstItem.price.product.id;
 
-						// Check product metadata to verify it's for dashboard
-						if (subscriptionId) {
-							try {
-								const subRes = await stripeFetch(env, `/subscriptions/${subscriptionId}`);
-								if (subRes.status === 200 && subRes.body?.items?.data?.length > 0) {
-									const firstItem = subRes.body.items.data[0];
-									if (firstItem.price && firstItem.price.product) {
-										const productId = typeof firstItem.price.product === 'string' ? firstItem.price.product : firstItem.price.product.id;
+// 										const productRes = await stripeFetch(env, `/products/${productId}`);
+// 										if (productRes.status === 200 && productRes.body?.metadata?.usedfor) {
+// 											const productUsedFor = productRes.body.metadata.usedfor;
+// 											console.log(`[invoice.payment_succeeded] 🏷️ Product metadata usedfor: ${productUsedFor}`);
 
-										const productRes = await stripeFetch(env, `/products/${productId}`);
-										if (productRes.status === 200 && productRes.body?.metadata?.usedfor) {
-											const productUsedFor = productRes.body.metadata.usedfor;
-											console.log(`[invoice.payment_succeeded] 🏷️ Product metadata usedfor: ${productUsedFor}`);
+// 											// Only process if product is for dashboard
+// 											if (productUsedFor !== 'dashboard') {
+// 												console.log(`[invoice.payment_succeeded] ⏭️ Skipping - Product usedfor is "${productUsedFor}", not "dashboard"`);
+// 												return new Response('ok'); // Skip processing
+// 											}
+// 										}
+// 									}
+// 								}
+// 							} catch (productErr) {
+// 								console.warn(`[invoice.payment_succeeded] ⚠️ Could not fetch product metadata:`, productErr);
+// 								// Continue processing if product fetch fails (backward compatibility)
+// 							}
+// 						}
 
-											// Only process if product is for dashboard
-											if (productUsedFor !== 'dashboard') {
-												console.log(`[invoice.payment_succeeded] ⏭️ Skipping - Product usedfor is "${productUsedFor}", not "dashboard"`);
-												return new Response('ok'); // Skip processing
-											}
-										}
-									}
-								}
-							} catch (productErr) {
-								console.warn(`[invoice.payment_succeeded] ⚠️ Could not fetch product metadata:`, productErr);
-								// Continue processing if product fetch fails (backward compatibility)
-							}
-						}
+// 						// Log invoice payment success
+// 						await logStripeEvent(env, event, subscriptionId, customerId, {
+// 							action: 'invoice_payment_succeeded',
+// 							invoice_id: invoice.id,
+// 							amount_paid: invoice.amount_paid,
+// 							currency: invoice.currency,
+// 							period_start: invoice.period_start,
+// 							period_end: invoice.period_end,
+// 							note: 'Invoice payment succeeded - renewal or initial payment',
+// 						});
 
-						// Log invoice payment success
-						await logStripeEvent(env, event, subscriptionId, customerId, {
-							action: 'invoice_payment_succeeded',
-							invoice_id: invoice.id,
-							amount_paid: invoice.amount_paid,
-							currency: invoice.currency,
-							period_start: invoice.period_start,
-							period_end: invoice.period_end,
-							note: 'Invoice payment succeeded - renewal or initial payment',
-						});
+// 						if (!subscriptionId || !customerId) {
+// 							console.error('Missing subscription_id or customer_id in invoice');
+// 							return new Response('ok'); // Return ok to prevent retries
+// 						}
 
-						if (!subscriptionId || !customerId) {
-							console.error('Missing subscription_id or customer_id in invoice');
-							return new Response('ok'); // Return ok to prevent retries
-						}
+// 						// Fetch subscription details to get quantity
+// 						const subRes = await stripeFetch(env, `/subscriptions/${subscriptionId}`);
+// 						if (subRes.status !== 200) {
+// 							console.error('Failed to fetch subscription:', subRes.status, subRes.body);
+// 							return new Response('ok');
+// 						}
 
-						// Fetch subscription details to get quantity
-						const subRes = await stripeFetch(env, `/subscriptions/${subscriptionId}`);
-						if (subRes.status !== 200) {
-							console.error('Failed to fetch subscription:', subRes.status, subRes.body);
-							return new Response('ok');
-						}
+// 						const subscription = subRes.body;
+//   const subscriptionMetadata = subscription.metadata || {};
+// 						const isUseCase3 = subscriptionMetadata.purchase_type === 'quantity' || subscriptionMetadata.usecase === '3';
+// 						const isusecase1= subscriptionMetadata.usecase === '1'||subscriptionMetadata.paymentby==='directlink';
+// 						if(isusecase1){
+// 							console.log('Skipping Use Case 1 subscription in invoice.payment_succeeded Saving Site_1 to DB');
+// 							return new Response('ok'); // Return ok - Use Case 1 handled elsewhere
+// 						}
 
-						const subscription = subRes.body;
+// 						if (isUseCase3) {
+// 							return new Response('ok'); // Return ok - licenses already exist for Use Case 3
+// 						}
+// 						// CRITICAL: Skip Use Case 3 (quantity purchases) - licenses already exist
+// 						// Use Case 3 subscriptions have metadata.purchase_type = 'quantity' and metadata.usecase = '3'
+						
 
-						// CRITICAL: Skip Use Case 3 (quantity purchases) - licenses already exist
-						// Use Case 3 subscriptions have metadata.purchase_type = 'quantity' and metadata.usecase = '3'
-						const subscriptionMetadata = subscription.metadata || {};
-						const isUseCase3 = subscriptionMetadata.purchase_type === 'quantity' || subscriptionMetadata.usecase === '3';
+// 						// CRITICAL: Check if subscription is cancelled before generating licenses
+// 						// Skip license generation for cancelled subscriptions
+// 						const isCancelled =
+// 							subscription.status === 'canceled' || subscription.cancel_at_period_end === true || subscription.canceled_at !== null;
 
-						if (isUseCase3) {
-							return new Response('ok'); // Return ok - licenses already exist for Use Case 3
-						}
+// 						// Also check database to see if subscription is marked as cancelled
+// 						let dbSubscriptionCancelled = false;
+// 						if (env.DB) {
+// 							try {
+// 								const dbSub = await env.DB.prepare(
+// 									'SELECT status, cancel_at_period_end FROM subscriptions WHERE subscription_id = ? LIMIT 1'
+// 								)
+// 									.bind(subscriptionId)
+// 									.first();
 
-						// CRITICAL: Check if subscription is cancelled before generating licenses
-						// Skip license generation for cancelled subscriptions
-						const isCancelled =
-							subscription.status === 'canceled' || subscription.cancel_at_period_end === true || subscription.canceled_at !== null;
+// 								if (dbSub) {
+// 									dbSubscriptionCancelled = dbSub.status === 'canceled' || dbSub.cancel_at_period_end === 1;
+// 								}
+// 							} catch (dbErr) {
+// 								console.error('Error checking subscription status in database:', dbErr);
+// 							}
+// 						}
 
-						// Also check database to see if subscription is marked as cancelled
-						let dbSubscriptionCancelled = false;
-						if (env.DB) {
-							try {
-								const dbSub = await env.DB.prepare(
-									'SELECT status, cancel_at_period_end FROM subscriptions WHERE subscription_id = ? LIMIT 1'
-								)
-									.bind(subscriptionId)
-									.first();
+// 						if (isCancelled || dbSubscriptionCancelled) {
+// 							return new Response('ok'); // Return ok - don't generate licenses for cancelled subscriptions
+// 						}
 
-								if (dbSub) {
-									dbSubscriptionCancelled = dbSub.status === 'canceled' || dbSub.cancel_at_period_end === 1;
-								}
-							} catch (dbErr) {
-								console.error('Error checking subscription status in database:', dbErr);
-							}
-						}
+// 						// Generate one license key per subscription item (site)
+// 						// Each subscription item represents one site, regardless of quantity
+// 						let siteCount = 1;
+// 						if (subscription.items && subscription.items.data && subscription.items.data.length > 0) {
+// 							// Count number of subscription items (sites), not quantities
+// 							siteCount = subscription.items.data.length;
+// 						}
 
-						if (isCancelled || dbSubscriptionCancelled) {
-							return new Response('ok'); // Return ok - don't generate licenses for cancelled subscriptions
-						}
+// 						// Get user record from database to map sites to subscription items
+// 						const userData = (await getUserByCustomerId(env, customerId)) || { sites: {} };
 
-						// Generate one license key per subscription item (site)
-						// Each subscription item represents one site, regardless of quantity
-						let siteCount = 1;
-						if (subscription.items && subscription.items.data && subscription.items.data.length > 0) {
-							// Count number of subscription items (sites), not quantities
-							siteCount = subscription.items.data.length;
-						}
+// 						// Check if licenses already exist for this subscription to avoid duplicates
+// 						let existingLicenses = [];
+// 						if (env.DB) {
+// 							try {
+// 								const existing = await env.DB.prepare('SELECT license_key, site_domain FROM licenses WHERE subscription_id = ?')
+// 									.bind(subscriptionId)
+// 									.all();
+// 								if (existing.success) {
+// 									existingLicenses = existing.results.map((r) => ({ key: r.license_key, site: r.site_domain }));
+// 								}
+// 							} catch (e) {
+// 								console.error('Error checking existing licenses:', e);
+// 							}
+// 						}
 
-						// Get user record from database to map sites to subscription items
-						const userData = (await getUserByCustomerId(env, customerId)) || { sites: {} };
+// 						// Map subscription items to sites and generate licenses
+// 						const licensesToCreate = [];
+// 						subscription.items.data.forEach((item, index) => {
+// 							// Get site from item metadata or user record
+// 							let site = item.metadata?.site;
+// 							if (!site) {
+// 								const siteEntry = Object.entries(userData.sites || {}).find(([_, data]) => data.item_id === item.id);
+// 								if (siteEntry) {
+// 									site = siteEntry[0];
+// 								} else {
+// 									site = `site_${index + 1}`;
+// 								}
+// 							}
 
-						// Check if licenses already exist for this subscription to avoid duplicates
-						let existingLicenses = [];
-						if (env.DB) {
-							try {
-								const existing = await env.DB.prepare('SELECT license_key, site_domain FROM licenses WHERE subscription_id = ?')
-									.bind(subscriptionId)
-									.all();
-								if (existing.success) {
-									existingLicenses = existing.results.map((r) => ({ key: r.license_key, site: r.site_domain }));
-								}
-							} catch (e) {
-								console.error('Error checking existing licenses:', e);
-							}
-						}
+// 							// Check if license already exists for this site
+// 							const existingForSite = existingLicenses.find((l) => l.site === site);
+// 							if (!existingForSite) {
+// 								licensesToCreate.push({ site, item_id: item.id });
+// 							}
+// 						});
 
-						// Map subscription items to sites and generate licenses
-						const licensesToCreate = [];
-						subscription.items.data.forEach((item, index) => {
-							// Get site from item metadata or user record
-							let site = item.metadata?.site;
-							if (!site) {
-								const siteEntry = Object.entries(userData.sites || {}).find(([_, data]) => data.item_id === item.id);
-								if (siteEntry) {
-									site = siteEntry[0];
-								} else {
-									site = `site_${index + 1}`;
-								}
-							}
+// 						if (licensesToCreate.length === 0) {
+// 							return new Response('ok');
+// 						}
 
-							// Check if license already exists for this site
-							const existingForSite = existingLicenses.find((l) => l.site === site);
-							if (!existingForSite) {
-								licensesToCreate.push({ site, item_id: item.id });
-							}
-						});
+// 						// Generate license keys - one per site
+// 						const licenseKeys = await generateLicenseKeys(licensesToCreate.length, env);
 
-						if (licensesToCreate.length === 0) {
-							return new Response('ok');
-						}
+// 						// Save licenses to D1 database with site mapping
+// 						if (env.DB) {
+// 							try {
+// 								const timestamp = Math.floor(Date.now() / 1000);
 
-						// Generate license keys - one per site
-						const licenseKeys = await generateLicenseKeys(licensesToCreate.length, env);
+// 								// Prepare insert statements with site_domain
+// 								const inserts = licenseKeys.map((key, idx) => {
+// 									const site = licensesToCreate[idx].site;
+// 									return env.DB.prepare(
+// 										'INSERT INTO licenses (customer_id, subscription_id, license_key, site_domain, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+// 									).bind(customerId, subscriptionId, key, site, 'active', timestamp, timestamp);
+// 								});
 
-						// Save licenses to D1 database with site mapping
-						if (env.DB) {
-							try {
-								const timestamp = Math.floor(Date.now() / 1000);
+// 								// Execute all inserts in a transaction
+// 								const batch = env.DB.batch(inserts);
+// 								await batch;
+// 							} catch (dbError) {
+// 								console.error('Database error saving licenses:', dbError);
+// 								// Log but don't fail - Stripe will retry if we return error
+// 							}
+// 						} else {
+// 							console.warn('D1 database not configured. License keys generated but not saved:', licenseKeys);
+// 						}
 
-								// Prepare insert statements with site_domain
-								const inserts = licenseKeys.map((key, idx) => {
-									const site = licensesToCreate[idx].site;
-									return env.DB.prepare(
-										'INSERT INTO licenses (customer_id, subscription_id, license_key, site_domain, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-									).bind(customerId, subscriptionId, key, site, 'active', timestamp, timestamp);
-								});
-
-								// Execute all inserts in a transaction
-								const batch = env.DB.batch(inserts);
-								await batch;
-							} catch (dbError) {
-								console.error('Database error saving licenses:', dbError);
-								// Log but don't fail - Stripe will retry if we return error
-							}
-						} else {
-							console.warn('D1 database not configured. License keys generated but not saved:', licenseKeys);
-						}
-
-						// Licenses are stored in database, no need to update user data structure
-						// (Licenses are now stored in the licenses table, not in user data)
-					}
+// 						// Licenses are stored in database, no need to update user data structure
+// 						// (Licenses are now stored in the licenses table, not in user data)
+// 					}
 
 					if (event.type === 'invoice.payment_failed') {
 						const invoice = event.data.object;
@@ -5841,640 +5904,141 @@ export default {
 			}
 
 			//DASHBOARD STARTS HERE
-			if (request.method === 'GET' && pathname === '/dashboard') {
-				try {
-					const url = new URL(request.url);
-
-					// Email from query (Memberstack) or sb_session cookie
-					const emailParam = url.searchParams.get('email');
-					const cookie = request.headers.get('cookie') || '';
-					const match = cookie.match(/sb_session=([^;]+)/);
-
-					let email = null;
-					let payload = null;
-
-					if (emailParam) {
-						email = emailParam.toLowerCase().trim();
-						payload = { email, customerId: null };
-					} else if (match) {
-						const token = match[1];
-						payload = await verifyToken(env, token);
-						if (!payload) {
-							return jsonResponse(401, { error: 'invalid session', message: 'Session token is invalid or expired' }, true, request);
-						}
-						email = payload.email;
-					} else {
-						return jsonResponse(401, { error: 'unauthenticated', message: 'No session cookie found' }, true, request);
-					}
-
-					if (!env.DB) {
-						console.error('[DASHBOARD] ❌ Database not configured (env.DB missing)');
-						return jsonResponse(500, { error: 'Database not configured' }, true, request);
-					}
-
-					const normalizedEmail = email.toLowerCase().trim();
-
-					const subscriptions = {};
-					const sites = {};
-					let allCustomerIds = [];
-					const allSubscriptions = [];
-
-					const allLicensesMap = {};
-					const quantityLicensesMap = {};
-
-					// ---------- STEP 1: customers ----------
-					try {
-						const [customersRes, paymentsCustomersRes] = await Promise.all([
-							env.DB.prepare('SELECT DISTINCT customer_id FROM customers WHERE user_email = ?').bind(normalizedEmail).all(),
-							env.DB.prepare('SELECT DISTINCT customer_id FROM payments WHERE email = ? AND customer_id IS NOT NULL')
-								.bind(normalizedEmail)
-								.all(),
-						]);
-
-						if (customersRes && customersRes.results) {
-							allCustomerIds = customersRes.results.map((r) => r.customer_id).filter(Boolean);
-						}
-
-						if (paymentsCustomersRes && paymentsCustomersRes.results) {
-							const paymentCustomerIds = paymentsCustomersRes.results.map((r) => r.customer_id).filter((id) => id && id.startsWith('cus_'));
-							allCustomerIds = [...new Set([...allCustomerIds, ...paymentCustomerIds])];
-						}
-					} catch (err) {
-						console.error('[DASHBOARD] ❌ Error finding customers by email:', err);
-					}
-
-					// ---------- STEP 2: subscriptions ----------
-					if (allCustomerIds.length > 0) {
-						try {
-							const placeholders = allCustomerIds.map(() => '?').join(',');
-							const subsRes = await env.DB.prepare(
-								`SELECT subscription_id, customer_id, status, cancel_at_period_end,
-                  cancel_at, current_period_start, current_period_end,
-                  billing_period, created_at
-           FROM subscriptions
-           WHERE customer_id IN (${placeholders}) AND user_email = ?`
-							)
-								.bind(...allCustomerIds, normalizedEmail)
-								.all();
-
-							if (subsRes && subsRes.results) {
-								const now = Math.floor(Date.now() / 1000);
-
-								for (const row of subsRes.results) {
-									const subscriptionId = row.subscription_id;
-									const customerId = row.customer_id;
-
-									let uiStatus = 'active';
-									if (row.status === 'canceled') {
-										uiStatus = 'cancelled';
-									} else if (row.cancel_at_period_end === 1) {
-										if (row.current_period_end && row.current_period_end < now) {
-											uiStatus = 'cancelled';
-										} else {
-											uiStatus = 'cancelling';
-										}
-									}
-
-									subscriptions[subscriptionId] = {
-										subscriptionId,
-										customerId,
-										status: uiStatus,
-										items: [],
-										sitesCount: 0,
-										created_at: row.created_at,
-										current_period_start: row.current_period_start,
-										current_period_end: row.current_period_end,
-										billingPeriod: row.billing_period || null,
-										cancel_at_period_end: row.cancel_at_period_end || 0,
-										canceled_at: row.cancel_at || null,
-									};
-
-									allSubscriptions.push({
-										subscriptionId,
-										customerId,
-										status: row.status || 'active',
-										created_at: row.created_at,
-									});
-								}
-							}
-						} catch (err) {
-							console.error('[DASHBOARD] ❌ Error finding subscriptions by customer IDs:', err);
-						}
-					}
-
-					const subscriptionIds = Object.keys(subscriptions);
-					let allLicensesResult = null;
-					// ---------- STEP 3 + 3.5: licenses + subscription_items ----------
-					if (subscriptionIds.length > 0) {
-						try {
-							// Batch queries to avoid SQLite's 999 variable limit
-							// Use smaller batch size (50) for queries with many columns to avoid SQLite limit
-							const [licensesRes, itemsRes] = await Promise.all([
-								batchQuery(
-									env,
-									subscriptionIds,
-									async (batch) => {
-										const placeholders = batch.map(() => '?').join(',');
-										return env.DB.prepare(
-											`SELECT license_key, site_domain, used_site_domain,
-                  subscription_id, item_id, status, purchase_type,
-                  billing_period, renewal_date, created_at, platform
-           FROM licenses
-           WHERE subscription_id IN (${placeholders})`
-										)
-											.bind(...batch)
-											.all();
-									},
-									50
-								),
-								batchQuery(
-									env,
-									subscriptionIds,
-									async (batch) => {
-										const placeholders = batch.map(() => '?').join(',');
-										return env.DB.prepare(
-											`SELECT subscription_id, item_id, site_domain, price_id,
-                  quantity, status, created_at, updated_at, removed_at
-           FROM subscription_items
-           WHERE subscription_id IN (${placeholders})`
-										)
-											.bind(...batch)
-											.all();
-									},
-									50
-								),
-							]);
-
-							allLicensesResult = licensesRes;
-
-							// map licenses
-							if (licensesRes && licensesRes.results) {
-								for (const lic of licensesRes.results) {
-									const siteDomain = lic.used_site_domain || lic.site_domain || null;
-
-									if (siteDomain) {
-										if (lic.purchase_type !== 'quantity') {
-											allLicensesMap[siteDomain] = {
-												license_key: lic.license_key,
-												status: lic.status || 'active',
-												created_at: lic.created_at,
-												billing_period: lic.billing_period || null,
-												renewal_date: lic.renewal_date || null,
-												purchase_type: lic.purchase_type || 'site',
-												used_site_domain: lic.used_site_domain || null,
-												site_domain: lic.site_domain || null,
-												platform: lic.platform || null, // Include platform from licenses table
-											};
-										}
-
-										if (lic.purchase_type === 'quantity') {
-											const activatedSite = lic.used_site_domain;
-											if (
-												activatedSite &&
-												!activatedSite.startsWith('license_') &&
-												!activatedSite.startsWith('quantity_') &&
-												activatedSite !== 'N/A' &&
-												!activatedSite.startsWith('KEY-')
-											) {
-												allLicensesMap[activatedSite] = {
-													license_key: lic.license_key,
-													status: lic.status || 'active',
-													created_at: lic.created_at,
-													billing_period: lic.billing_period || null,
-													renewal_date: lic.renewal_date || null,
-													purchase_type: 'quantity',
-													used_site_domain: lic.used_site_domain,
-													site_domain: lic.site_domain || null,
-													platform: lic.platform || null, // Include platform from licenses table
-												};
-											}
-										}
-									}
-
-									if (lic.purchase_type === 'quantity') {
-										const subId = lic.subscription_id;
-										if (!quantityLicensesMap[subId]) {
-											quantityLicensesMap[subId] = {};
-										}
-										const key = lic.item_id || subId;
-										quantityLicensesMap[subId][key] = {
-											license_key: lic.license_key,
-											status: lic.status || 'active',
-											created_at: lic.created_at,
-											item_id: lic.item_id || null,
-											purchase_type: 'quantity',
-											billing_period: lic.billing_period || null,
-											renewal_date: lic.renewal_date || null,
-											used_site_domain: lic.used_site_domain || null,
-											site_domain: lic.site_domain || null,
-											platform: lic.platform || null, // Include platform from licenses table
-										};
-									}
-								}
-							}
-
-							// items -> subscriptions[subId].items
-							if (itemsRes && itemsRes.results) {
-								const itemsBySubscription = {};
-								for (const row of itemsRes.results) {
-									const subId = row.subscription_id;
-									if (!itemsBySubscription[subId]) itemsBySubscription[subId] = [];
-									itemsBySubscription[subId].push(row);
-								}
-
-								for (const [subId, items] of Object.entries(itemsBySubscription)) {
-									if (!subscriptions[subId]) continue;
-
-									let billingPeriod = subscriptions[subId].billingPeriod || null;
-									const isSubCancelled =
-										subscriptions[subId].cancel_at_period_end === 1 ||
-										subscriptions[subId].status === 'cancelled' ||
-										subscriptions[subId].status === 'cancelling';
-
-									let subscriptionPurchaseType = null;
-									const quantityLicenses = quantityLicensesMap[subId];
-
-									// CRITICAL: Filter out "site_1" placeholder entries before mapping
-									const filteredItems = items.filter((item) => {
-										if (item.site_domain && /^site_\d+$/.test(item.site_domain)) {
-											console.log(`[DASHBOARD] ⚠️ Filtering out placeholder site "${item.site_domain}" from subscription_items`);
-											return false;
-										}
-										return true;
-									});
-
-									subscriptions[subId].items = filteredItems.map((item) => {
-										const quantityLicense =
-											(quantityLicenses && quantityLicenses[item.item_id]) || (quantityLicenses && quantityLicenses[subId]);
-
-										const isQuantityPurchase = !!quantityLicense;
-										let itemPurchaseType = item.purchase_type;
-										if (!itemPurchaseType) {
-											itemPurchaseType = isQuantityPurchase ? 'quantity' : 'site';
-										}
-										if (!subscriptionPurchaseType) {
-											subscriptionPurchaseType = itemPurchaseType;
-										}
-
-										const dbStatus = (item.status || '').toLowerCase().trim();
-
-										// NEW: derive effective status using existing sites/licenses logic
-										const siteDomain = item.site_domain;
-										const siteFromSites = sites[siteDomain]; // built later, so we fall back to DB/lic
-										const siteStatusDb = (siteFromSites?.status || '').toLowerCase().trim();
-										const licenseStatusDb = (quantityLicense?.status || allLicensesMap[siteDomain]?.status || '').toLowerCase().trim();
-
-										let finalStatus;
-										if (siteStatusDb === 'inactive' || siteStatusDb === 'cancelled' || siteStatusDb === 'canceled') {
-											finalStatus = 'inactive';
-										} else if (dbStatus === 'inactive' || dbStatus === 'cancelled' || dbStatus === 'canceled') {
-											finalStatus = 'inactive';
-										} else if (licenseStatusDb === 'inactive' || licenseStatusDb === 'cancelled' || licenseStatusDb === 'canceled') {
-											finalStatus = 'inactive';
-										} else if (isSubCancelled) {
-											finalStatus = 'inactive';
-										} else {
-											finalStatus = 'active';
-										}
-
-										return {
-											item_id: item.item_id,
-											site: item.site_domain,
-											site_domain: item.site_domain,
-											price: item.price_id,
-											quantity: item.quantity || 1,
-											status: finalStatus, // <-- frontend reads this
-											created_at: item.created_at,
-											removed_at: item.removed_at || null,
-											purchase_type: itemPurchaseType,
-											license_key: quantityLicense?.license_key || null,
-										};
-									});
-
-									if (subscriptionPurchaseType === 'quantity' && allLicensesResult) {
-										const activatedLicenses =
-											allLicensesResult.results?.filter(
-												(lic) =>
-													lic.subscription_id === subId &&
-													lic.purchase_type === 'quantity' &&
-													lic.used_site_domain &&
-													!lic.used_site_domain.startsWith('license_') &&
-													!lic.used_site_domain.startsWith('quantity_') &&
-													lic.used_site_domain !== 'N/A' &&
-													!lic.used_site_domain.startsWith('KEY-')
-											) || [];
-
-										const existingSites = new Set(
-											subscriptions[subId].items
-												.map((i) => i.site || i.site_domain || '')
-												.filter(Boolean)
-												.map((s) => s.toLowerCase().trim())
-										);
-
-										for (const lic of activatedLicenses) {
-											const activatedSite = lic.used_site_domain.toLowerCase().trim();
-											if (existingSites.has(activatedSite)) continue;
-
-											let itemId = lic.item_id;
-											if (!itemId) {
-												const shortKey = (lic.license_key || '').slice(0, 8);
-												itemId = `${shortKey}_${subId.slice(0, 12)}`;
-											}
-
-											let priceId = null;
-											if (subscriptions[subId].items.length > 0) {
-												priceId = subscriptions[subId].items[0].price;
-											}
-
-											// derive status for these synthetic items as well
-											const licenseStatusDb = (lic.status || '').toLowerCase().trim();
-											const finalStatus =
-												licenseStatusDb === 'inactive' ||
-												licenseStatusDb === 'cancelled' ||
-												licenseStatusDb === 'canceled' ||
-												isSubCancelled
-													? 'inactive'
-													: 'active';
-
-											subscriptions[subId].items.push({
-												item_id: itemId,
-												site: lic.used_site_domain,
-												site_domain: lic.used_site_domain,
-												price: priceId,
-												quantity: 1,
-												status: finalStatus,
-												created_at: lic.created_at,
-												removed_at: null,
-												purchase_type: 'quantity',
-												license_key: lic.license_key,
-												isActivated: true,
-												billing_period: lic.billing_period,
-												renewal_date: lic.renewal_date,
-											});
-
-											existingSites.add(activatedSite);
-										}
-									}
-
-									subscriptions[subId].sitesCount = subscriptions[subId].items.length;
-									subscriptions[subId].billingPeriod = billingPeriod;
-									subscriptions[subId].purchase_type = subscriptionPurchaseType || 'site';
-								}
-							}
-						} catch (err) {
-							console.error('[DASHBOARD] ❌ Error fetching subscription items/licenses:', err);
-						}
-					}
-
-					// ---------- STEP 5: build sites object (sites -> items -> licenses) ----------
-					// Filter out Use Case 3 (quantity) subscriptions - they're handled separately
-					const useCase2Subscriptions = Object.fromEntries(
-						Object.entries(subscriptions).filter(([subId, sub]) => {
-							const purchaseType = sub.purchase_type || 'site';
-							return purchaseType !== 'quantity';
-						})
-					);
-
-					console.log('[USE CASE 2 - DASHBOARD] 🔍 STEP 4: Building sites object from subscription items');
-					console.log(
-						'[USE CASE 2 - DASHBOARD] 📊 Processing',
-						Object.keys(useCase2Subscriptions).length,
-						'Use Case 2 subscription(s) (filtered from',
-						Object.keys(subscriptions).length,
-						'total)'
-					);
-
-					let useCase2SiteCount = 0;
-
-					for (const [subId, subscription] of Object.entries(useCase2Subscriptions)) {
-						const customerId = subscription.customerId;
-
-						for (const item of subscription.items) {
-							// include both active and inactive items
-
-							const siteDomain = item.site || item.site_domain;
-							const itemPurchaseType = item.purchase_type || subscription.purchase_type || 'site';
-
-							if (!siteDomain || !siteDomain.trim()) continue;
-
-							const isActivatedLicense =
-								(item.isActivated && item.purchase_type === 'quantity') || (!!item.license_key && item.purchase_type === 'quantity');
-
-							// CRITICAL: Exclude "site_1", "site_2", etc. placeholder entries from dashboard
-							// These are placeholders that shouldn't be displayed
-							// For site purchases (Use Case 1/2), always exclude placeholders
-							// For quantity purchases, only allow if it's an activated license with a real site domain
-							if (siteDomain.startsWith('site_') && /^site_\d+$/.test(siteDomain)) {
-								// For site purchases (Use Case 1/2), always exclude "site_1" placeholders
-								if (itemPurchaseType === 'site') {
-									console.log(`[DASHBOARD] ⏭️ Skipping placeholder site "${siteDomain}" - site purchases should have real domains`);
-									continue;
-								}
-
-								// For quantity purchases, only allow if it's an activated license with a real site domain
-								if (isActivatedLicense && itemPurchaseType === 'quantity') {
-									// Check if there's a used_site_domain - if not, skip this placeholder
-									const licenseBySite = allLicensesMap[siteDomain];
-									const licenseByKey =
-										allLicensesResult?.results?.find(
-											(lic) => lic.subscription_id === subId && lic.license_key === item.license_key && lic.used_site_domain
-										) || null;
-
-									const lic = licenseBySite || licenseByKey;
-									// Only continue if there's a real site domain, otherwise skip the placeholder
-									if (!lic || !lic.used_site_domain) {
-										console.log(`[DASHBOARD] ⏭️ Skipping placeholder site "${siteDomain}" - no real site domain found`);
-										continue;
-									}
-								} else {
-									// For quantity purchases that aren't activated, exclude placeholders
-									console.log(`[DASHBOARD] ⏭️ Skipping placeholder site "${siteDomain}" - quantity purchase not activated`);
-									continue;
-								}
-							}
-
-							if ((siteDomain.startsWith('license_') || siteDomain.startsWith('quantity_')) && !isActivatedLicense) continue;
-
-							let actualSiteDomain = siteDomain;
-
-							if (isActivatedLicense && item.purchase_type === 'quantity') {
-								const licenseBySite = allLicensesMap[siteDomain];
-								const licenseByKey =
-									allLicensesResult?.results?.find(
-										(lic) => lic.subscription_id === subId && lic.license_key === item.license_key && lic.used_site_domain
-									) || null;
-
-								const lic = licenseBySite || licenseByKey;
-								if (lic && lic.used_site_domain) {
-									actualSiteDomain = lic.used_site_domain;
-								} else {
-									continue;
-								}
-							}
-
-							const licenseForSite =
-								allLicensesMap[actualSiteDomain] || (item.license_key ? { license_key: item.license_key, status: 'active' } : null);
-
-							let siteDetails = null;
-							try {
-								// CRITICAL: Skip query if site_domain is a placeholder
-								if (actualSiteDomain && /^site_\d+$/.test(actualSiteDomain)) {
-									console.log(`[DASHBOARD] ⚠️ Skipping site details query for placeholder: "${actualSiteDomain}"`);
-									siteDetails = null;
-								} else {
-									siteDetails = await env.DB.prepare(
-										`SELECT amount_paid, currency, status, platform,
-                      current_period_start, current_period_end,
-                      renewal_date, cancel_at_period_end, canceled_at
-               FROM sites
-               WHERE customer_id = ? AND subscription_id = ? AND site_domain = ?
-               LIMIT 1`
-									)
-										.bind(customerId, subId, actualSiteDomain)
-										.first();
-								}
-							} catch (err) {
-								console.error('[DASHBOARD] ⚠️ Error fetching site details:', err);
-							}
-
-							const purchaseType = item.purchase_type || subscription.purchase_type || licenseForSite?.purchase_type || 'site';
-
-							// status priority: sites.status → subscription_items.status → licenses.status
-							const itemStatus = (item.status || '').toLowerCase().trim();
-							const siteStatusDb = (siteDetails?.status || '').toLowerCase().trim();
-							const licenseStatusDb = (licenseForSite?.status || '').toLowerCase().trim();
-
-							let effectiveStatus = 'active';
-							if (siteStatusDb === 'inactive' || siteStatusDb === 'cancelled' || siteStatusDb === 'canceled') {
-								effectiveStatus = 'inactive';
-							} else if (itemStatus === 'inactive' || itemStatus === 'cancelled' || itemStatus === 'canceled') {
-								effectiveStatus = 'inactive';
-							} else if (licenseStatusDb === 'inactive' || licenseStatusDb === 'cancelled' || licenseStatusDb === 'canceled') {
-								effectiveStatus = 'inactive';
-							}
-
-							const licenseSiteDomain = licenseForSite?.used_site_domain || licenseForSite?.site_domain || null;
-							const licenseStatus = licenseStatusDb || 'active';
-
-							// Get platform from siteDetails (sites table), license, or detect from domain
-							let platform = siteDetails?.platform || licenseForSite?.platform || null;
-
-							// If platform not found, try to detect from domain (optional - can be slow)
-							// For now, we'll just use what's in the database
-
-							// CRITICAL: Final safety check - don't add "site_1" placeholders to sites object
-							if (actualSiteDomain && /^site_\d+$/.test(actualSiteDomain) && itemPurchaseType === 'site') {
-								console.log(`[DASHBOARD] ⚠️ Final safety check: Skipping placeholder site "${actualSiteDomain}" from sites object`);
-								continue;
-							}
-
-							sites[actualSiteDomain] = {
-								item_id: item.item_id,
-								price: item.price,
-								quantity: item.quantity || 1,
-								status: effectiveStatus, // final site status
-								platform: platform, // Platform from sites table or licenses
-
-								cancelAtPeriodEnd: siteDetails?.cancel_at_period_end ?? subscription.cancel_at_period_end ?? false,
-
-								subscription_id: subId,
-
-								license_key: licenseForSite?.license_key || item.license_key || null,
-								license_status: licenseStatus,
-								license_site_domain: licenseSiteDomain,
-
-								purchase_type: purchaseType,
-								billing_period: subscription.billingPeriod || licenseForSite?.billing_period || null,
-
-								amount_paid: siteDetails?.amount_paid || null,
-								currency: siteDetails?.currency || 'usd',
-								current_period_start: siteDetails?.current_period_start || subscription.current_period_start || null,
-								current_period_end: siteDetails?.current_period_end || subscription.current_period_end || null,
-								renewal_date: siteDetails?.renewal_date || licenseForSite?.renewal_date || subscription.current_period_end || null,
-								cancel_at_period_end: siteDetails?.cancel_at_period_end ?? subscription.cancel_at_period_end ?? false,
-								canceled_at: siteDetails?.canceled_at || subscription.canceled_at || null,
-							};
-
-							if (purchaseType === 'site') {
-								useCase2SiteCount++;
-							}
-						}
-					}
-
-					console.log('[USE CASE 2 - DASHBOARD] ✅ STEP 4 COMPLETE: Added', useCase2SiteCount, 'Use Case 2 site(s) to sites object');
-
-					// ---------- pending_sites ----------
-					let pendingSites = [];
-					try {
-						const pendingRes = await env.DB.prepare('SELECT site_domain FROM pending_sites WHERE user_email = ?')
-							.bind(normalizedEmail)
-							.all();
-						if (pendingRes && pendingRes.results) {
-							pendingSites = pendingRes.results.map((r) => r.site_domain).filter(Boolean);
-						}
-					} catch (err) {
-						console.error('[DASHBOARD] ⚠️ Error fetching pending sites:', err);
-					}
-
-					// ---------- payment history ----------
-					let paymentHistory = [];
-					try {
-						const paymentsRes = await env.DB.prepare(
-							`SELECT id, customer_id, subscription_id, email, amount, currency,
-                site_domain, status, created_at
-         FROM payments
-         WHERE email = ?
-         ORDER BY created_at DESC`
-						)
-							.bind(normalizedEmail)
-							.all();
-
-						if (paymentsRes && paymentsRes.results) {
-							paymentHistory = paymentsRes.results.map((p) => ({
-								id: p.id,
-								payment_id: p.id,
-								customer_id: p.customer_id,
-								subscription_id: p.subscription_id,
-								email: p.email,
-								amount: p.amount,
-								currency: p.currency,
-								site_domain: p.site_domain,
-								status: p.status,
-								created_at: p.created_at,
-							}));
-						}
-					} catch (err) {
-						console.error('[DASHBOARD] ⚠️ Error fetching payment history:', err);
-					}
-
-					return jsonResponse(
-						200,
-						{
-							sites,
-							subscriptions,
-							pendingSites,
-							paymentHistory,
-							subscription:
-								allSubscriptions.length > 0
-									? {
-											id: allSubscriptions[0].subscriptionId,
-											customerId: allSubscriptions[0].customerId,
-											email: email || null,
-									  }
-									: null,
-							subscriptionId: allSubscriptions.length > 0 ? allSubscriptions[0].subscriptionId : null,
-							customerId: allCustomerIds.length > 0 ? allCustomerIds[0] : null,
-							allCustomerIds,
-							email,
-						},
-						true,
-						request
-					);
-				} catch (err) {
-					console.error('[DASHBOARD] ❌ Unexpected error:', err);
-					return jsonResponse(500, { error: 'internal_error', message: err.message }, true, request);
-				}
-			}
+if (request.method === 'GET' && pathname === '/dashboard') {
+  try {
+    const url = new URL(request.url);
+    // ---------------------------------------------------
+    // 1. EMAIL (FROM FRONTEND)
+    // ---------------------------------------------------
+    const emailParam = url.searchParams.get('email');
+    if (!emailParam) {
+      return jsonResponse(
+        400,
+        { error: 'email_required', message: 'Email is required' },
+        true,
+        request
+      );
+    }
+    const email = emailParam.toLowerCase().trim();
+    if (!env.DB) {
+      console.error('[DASHBOARD] :x: DB not configured');
+      return jsonResponse(500, { error: 'db_not_configured' }, true, request);
+    }
+    // ---------------------------------------------------
+    // 2. FETCH FROM SITES ONLY
+    // ---------------------------------------------------
+    const sitesRes = await env.DB.prepare(`
+      SELECT
+        id,
+        user_email,
+        customer_id,
+        subscription_id,
+        item_id,
+        site_domain,
+        price_id,
+        amount_paid,
+        currency,
+        status,
+        platform,
+        license_key,
+        current_period_start,
+        current_period_end,
+        renewal_date,
+        cancel_at_period_end,
+        canceled_at,
+        created_at
+      FROM sites
+      WHERE user_email = ?
+      ORDER BY created_at DESC
+    `)
+      .bind(email)
+      .all();
+    // ---------------------------------------------------
+    // 3. BUILD RESPONSE OBJECTS
+    // ---------------------------------------------------
+    const sites = {};
+    const subscriptions = {};
+    for (const row of sitesRes.results || []) {
+      // -----------------------
+      // SITES OBJECT
+      // -----------------------
+      sites[row.site_domain] = {
+        site_domain: row.site_domain,
+        subscription_id: row.subscription_id,
+        customer_id: row.customer_id,
+        item_id: row.item_id,
+        price: row.price_id,
+        amount_paid: row.amount_paid,
+        currency: row.currency,
+        status: row.status,
+        platform: row.platform,
+        // :white_check_mark: LICENSE KEY — ONLY FROM SITES
+        license_key: row.license_key,
+        current_period_start: row.current_period_start,
+        current_period_end: row.current_period_end,
+        renewal_date: row.renewal_date,
+        cancel_at_period_end: !!row.cancel_at_period_end,
+        canceled_at: row.canceled_at,
+        created_at: row.created_at,
+      };
+      // -----------------------
+      // SUBSCRIPTIONS (LEGACY)
+      // -----------------------
+      if (!subscriptions[row.subscription_id]) {
+        subscriptions[row.subscription_id] = {
+          subscriptionId: row.subscription_id,
+          customerId: row.customer_id,
+          status: row.status,
+          items: [],
+          sitesCount: 0,
+          purchase_type: 'site',
+        };
+      }
+      subscriptions[row.subscription_id].items.push({
+        item_id: row.item_id,
+        site_domain: row.site_domain,
+        status: row.status,
+        license_key: row.license_key,
+      });
+      subscriptions[row.subscription_id].sitesCount++;
+    }
+    const subscriptionIds = Object.keys(subscriptions);
+    const firstSub = subscriptionIds.length > 0 ? subscriptions[subscriptionIds[0]] : null;
+    // ---------------------------------------------------
+    // 4. FINAL RESPONSE (FRONTEND SAFE)
+    // ---------------------------------------------------
+    return jsonResponse(
+      200,
+      {
+        sites,
+        subscriptions,
+        pendingSites: [],        // kept for compatibility
+        paymentHistory: [],      // kept for compatibility
+        subscription: firstSub
+          ? {
+              id: firstSub.subscriptionId,
+              customerId: firstSub.customerId,
+              email,
+            }
+          : null,
+        subscriptionId: firstSub?.subscriptionId || null,
+        customerId: firstSub?.customerId || null,
+        allCustomerIds: firstSub?.customerId ? [firstSub.customerId] : [],
+        email,
+      },
+      true,
+      request
+    );
+  } catch (err) {
+    console.error('[DASHBOARD] :x: Unexpected error:', err);
+    return jsonResponse(
+      500,
+      { error: 'internal_error', message: err.message },
+      true,
+      request
+    );
+  }
+}
 // DASHBOARD ENDS HERE
 			// GET /api/sites/status - Check sites queue processing status
 			if (request.method === 'GET' && pathname === '/api/sites/status') {
@@ -6941,11 +6505,11 @@ if (request.method === 'GET' && pathname === '/api/licenses/status') {
 					let productId, unitAmount;
 					const currency = 'usd'; // Default to USD
 					if (normalizedPeriod === 'monthly') {
-						productId = env.MONTHLY_PRODUCT_ID || env.MONTHLY_LICENSE_PRODUCT_ID || 'prod_SHWZdF20XLXtn9';
+						productId = env.MONTHLY_PRODUCT_ID || env.MONTHLY_LICENSE_PRODUCT_ID || 'prod_TiG3c1jjtQHRLK';
 						unitAmount = parseInt(env.MONTHLY_UNIT_AMOUNT || env.MONTHLY_LICENSE_UNIT_AMOUNT || '800');
 					} else {
-						productId = env.YEARLY_PRODUCT_ID || env.YEARLY_LICENSE_PRODUCT_ID || 'prod_SJQgqC8uDgRcOi';
-						unitAmount = parseInt(env.YEARLY_UNIT_AMOUNT || env.YEARLY_LICENSE_UNIT_AMOUNT || '7500');
+						productId = env.YEARLY_PRODUCT_ID || env.YEARLY_LICENSE_PRODUCT_ID || 'prod_TiG4YkK61hiKKR';
+						unitAmount = parseInt(env.YEARLY_UNIT_AMOUNT || env.YEARLY_LICENSE_UNIT_AMOUNT || '7200');
 					}
 
 					// Calculate total amount (for metadata purposes)
@@ -7565,398 +7129,107 @@ if (request.method === 'GET' && pathname === '/api/licenses/status') {
 				}
 			}
 
-      // if (request.method === 'GET' && pathname === '/licenses') {
-       
-      //   // Try to get email from query parameter (for Memberstack users)
-      //   const emailParam = url.searchParams.get('email');
-       
-      //   // Pagination parameters
-      //   const limit = parseInt(url.searchParams.get('limit')) || 10;
-      //   const offset = parseInt(url.searchParams.get('offset')) || 0;
-      //   const status = url.searchParams.get('status'); // 'available', 'activated', 'cancelling', 'cancelled'
-       
-      //   const cookie = request.headers.get('cookie') || '';
-      //   const match = cookie.match(/sb_session=([^;]+)/);
-      //   let payload = null;
-      //   let email = null;
-      //   let customerId = null;
-       
-      //   if (emailParam) {
-      //     email = emailParam.toLowerCase().trim();
-      //     payload = { email: email, customerId: null };
-      //   } else if (match) {
-      //   const token = match[1];
-      //     payload = await verifyToken(env, token);
-      //   if (!payload) {
-      //       return jsonResponse(401, { error: 'invalid session', message: 'Session token is invalid or expired', licenses: [], pagination: { total: 0, hasMore: false } }, true, request);
-      //     }
-      //     email = payload.email;
-      //     customerId = payload.customerId;
-      //   } else {
-      //     return jsonResponse(401, { error: 'unauthenticated', message: 'No session cookie found', licenses: [], pagination: { total: 0, hasMore: false } }, true, request);
-      //   }
+  if (request.method === 'GET' && pathname === '/licenses') {
+  try {
+    // Get email from query parameter
+    const email = url.searchParams.get('email');
+    
+    if (!email) {
+      return jsonResponse(400, { 
+        error: 'missing_email',
+        message: 'Email parameter is required' 
+      }, true, request);
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Validate email format
+    if (!normalizedEmail.includes('@')) {
+      return jsonResponse(400, { 
+        error: 'invalid_email',
+        message: 'Invalid email format' 
+      }, true, request);
+    }
+
+    console.log(`[GET /licenses] Fetching licenses for: ${normalizedEmail}`);
+
+    // Fetch licenses from database
+    if (!env.DB) {
+      return jsonResponse(500, { 
+        error: 'database_not_configured',
+        message: 'Database is not configured' 
+      }, true, request);
+    }
+
+    // Query licenses table where user_email matches
+    const result = await env.DB.prepare(`
+      SELECT 
+        license_key,
+        user_email,
+        customer_id,
+        subscription_id,
+        item_id,
+        site_domain,
+        used_site_domain,
+        platform,
+        status,
+        purchase_type,
+        billing_period,
+        renewal_date,
+        created_at,
+        updated_at
+      FROM licenses
+      WHERE LOWER(TRIM(user_email)) = ?
+      ORDER BY created_at DESC
+    `).bind(normalizedEmail).all();
+
+    if (!result || !result.results) {
+      return jsonResponse(200, { 
+        success: true,
+        licenses: [],
+        total: 0
+      }, true, request);
+    }
+
+    // Format licenses
+    const licenses = result.results.map(row => ({
+      licenseKey: row.license_key,
+      userEmail: row.user_email,
+      customerId: row.customer_id,
+      subscriptionId: row.subscription_id,
+      itemId: row.item_id,
+      siteDomain: row.site_domain,
+      usedSiteDomain: row.used_site_domain,
+      platform: row.platform,
+      status: row.status,
+      purchaseType: row.purchase_type,
+      billingPeriod: row.billing_period,
+      renewalDate: row.renewal_date,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }));
+
+    console.log(`[GET /licenses] Found ${licenses.length} licenses for ${normalizedEmail}`);
+
+    return jsonResponse(200, { 
+      success: true,
+      licenses,
+      total: licenses.length,
+      email: normalizedEmail
+    }, true, request);
+
+  } catch (error) {
+    console.error('[GET /licenses] Error:', error);
+    return jsonResponse(500, { 
+      error: 'internal_error',
+      message: error.message 
+    }, true, request);
+  }
+}
 
 
-      //   // CRITICAL: Find ALL customers with the same email to get all licenses
-      //   let allCustomerIds = customerId ? [customerId] : [];
-      //   if (email && env.DB) {
-      //     try {
-      //       // First, get customer IDs from the customers table (primary source)
-      //       const customersRes = await env.DB.prepare(
-      //         'SELECT DISTINCT customer_id FROM customers WHERE user_email = ?'
-      //       ).bind(email.toLowerCase().trim()).all();
-           
-      //       if (customersRes && customersRes.results) {
-      //         const foundCustomerIds = customersRes.results
-      //           .map(row => row.customer_id)
-      //           .filter(id => id && id.startsWith('cus_'));
-      //         allCustomerIds = [...new Set([...allCustomerIds, ...foundCustomerIds])];
-      //       }
-           
-      //       // Also check payments table for any additional customer IDs
-      //       const paymentsRes = await env.DB.prepare(
-      //         'SELECT DISTINCT customer_id FROM payments WHERE email = ? AND customer_id IS NOT NULL'
-      //       ).bind(email.toLowerCase().trim()).all();
-           
-      //       if (paymentsRes && paymentsRes.results) {
-      //         const paymentCustomerIds = paymentsRes.results
-      //           .map(row => row.customer_id)
-      //           .filter(id => id && id.startsWith('cus_'));
-      //         allCustomerIds = [...new Set([...allCustomerIds, ...paymentCustomerIds])];
-      //       }
-           
-      //       // Filter out null values and ensure all are valid customer IDs
-      //       allCustomerIds = allCustomerIds.filter(id => id && id.startsWith('cus_'));
-           
-      //     } catch (dbErr) {
-      //       console.error('Error finding all customers by email for licenses:', dbErr);
-      //     }
-      //   }
-
-
-      //   try {
-      //     let licenses = [];
-      //     let d1Error = null;
-      //     let kvError = null;
-
-
-      //     // Try to get from D1 database first - query ALL customer IDs
-      //     if (env.DB) {
-      //       try {
-      //         // Build query for all customer IDs
-      //         // Batch query to avoid SQLite's 999 variable limit
-      //         let result = { results: [] };
-      //         try {
-      //           // Use smaller batch size (50) for queries with many columns (11 columns)
-      //           const batchResult = await batchQuery(env, allCustomerIds, async (batch) => {
-      //             const placeholders = batch.map(() => '?').join(',');
-      //             return env.DB.prepare(
-      //               `SELECT license_key, platform, site_domain, used_site_domain, status, purchase_type, created_at, customer_id, subscription_id, item_id, billing_period, renewal_date FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
-      //             ).bind(...batch).all();
-      //           }, 50);
-      //           result = batchResult;
-      //         } catch (columnErr) {
-      //           // Fallback if new columns don't exist yet
-      //           if (columnErr.message && (columnErr.message.includes('no such column: used_site_domain') || columnErr.message.includes('no such column: purchase_type'))) {
-      //             try {
-      //               const batchResult = await batchQuery(env, allCustomerIds, async (batch) => {
-      //                 const placeholders = batch.map(() => '?').join(',');
-      //                 return env.DB.prepare(
-      //                   `SELECT license_key,platform, site_domain, status, created_at, customer_id, subscription_id, item_id, purchase_type, billing_period, renewal_date FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
-      //                 ).bind(...batch).all();
-      //               });
-      //               result = batchResult;
-      //             } catch (fallbackErr) {
-      //               if (fallbackErr.message && fallbackErr.message.includes('no such column: site_domain')) {
-      //                 const batchResult = await batchQuery(env, allCustomerIds, async (batch) => {
-      //                   const placeholders = batch.map(() => '?').join(',');
-      //                   return env.DB.prepare(
-      //                     `SELECT license_key,platform, status, created_at, customer_id FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
-      //                   ).bind(...batch).all();
-      //                 });
-      //                 result = batchResult;
-      //               } else {
-      //                 throw fallbackErr;
-      //               }
-      //             }
-      //           } else {
-      //             throw columnErr;
-      //           }
-      //         }
-
-
-      //         // batchQuery returns { results: [] }, not { success, results }
-      //         // Check if results exist (will be empty array if no licenses found)
-      //         if (result && result.results) {
-      //           // Get subscription statuses for all subscription IDs (batched to avoid SQLite limit)
-      //           const subscriptionIds = [...new Set(result.results.map(r => r.subscription_id).filter(Boolean))];
-      //           const subscriptionStatusMap = {};
-               
-      //           if (subscriptionIds.length > 0 && env.DB) {
-      //             try {
-      //               const subStatusRes = await batchQuery(env, subscriptionIds, async (batch) => {
-      //                 const placeholders = batch.map(() => '?').join(',');
-      //                 return env.DB.prepare(
-      //                   `SELECT subscription_id, status, cancel_at_period_end, cancel_at, current_period_end
-      //                    FROM subscriptions
-      //                    WHERE subscription_id IN (${placeholders})`
-      //                 ).bind(...batch).all();
-      //               });
-                   
-      //               if (subStatusRes && subStatusRes.results) {
-      //                 subStatusRes.results.forEach(sub => {
-      //                   subscriptionStatusMap[sub.subscription_id] = {
-      //                     status: sub.status,
-      //                     cancel_at_period_end: sub.cancel_at_period_end === 1,
-      //                     cancel_at: sub.cancel_at,
-      //                     current_period_end: sub.current_period_end
-      //                   };
-      //                 });
-      //               }
-      //             } catch (subErr) {
-      //               console.error('[Licenses] Error fetching subscription statuses:', subErr);
-      //             }
-      //           }
-               
-      //           licenses = result.results.map(row => {
-      //             const subscriptionInfo = row.subscription_id ? subscriptionStatusMap[row.subscription_id] : null;
-      //             const isSubscriptionCancelled = subscriptionInfo && (
-      //               subscriptionInfo.status === 'canceled' ||
-      //               subscriptionInfo.cancel_at_period_end ||
-      //               subscriptionInfo.cancel_at !== null
-      //             );
-                 
-      //             // Debug logging for cancelled subscriptions
-      //             if (isSubscriptionCancelled) {
-      //               // Subscription cancellation details available
-      //             }
-                 
-      //             return {
-      //               license_key: row.license_key,
-      //               site_domain: row.site_domain || null,
-      //               used_site_domain: row.used_site_domain || null, // May not exist in old schema
-      //               status: row.status || 'active',
-      //               purchase_type: row.purchase_type || 'site', // May not exist in old schema
-      //               created_at: row.created_at,
-      //               customer_id: row.customer_id || customerId,
-      //               subscription_id: row.subscription_id || null,
-      //               item_id: row.item_id || null,
-      //               billing_period: row.billing_period || null, // From licenses table
-      //               renewal_date: row.renewal_date || subscriptionInfo?.current_period_end || null, // From licenses table or subscription
-      //               subscription_status: subscriptionInfo?.status || null,
-      //               subscription_cancelled: isSubscriptionCancelled || false,
-      //               subscription_cancel_at_period_end: subscriptionInfo?.cancel_at_period_end || false,
-      //               subscription_current_period_end: subscriptionInfo?.current_period_end || null
-      //             };
-      //           });
-      //         } else {
-      //           // No results found (empty array is valid, so this shouldn't happen)
-      //           // But log if result is null/undefined
-      //           if (!result) {
-      //             console.warn(`[Licenses] D1 query returned null/undefined for customer ${customerId}`);
-      //             d1Error = 'D1 query returned no result';
-      //           }
-      //         }
-      //       } catch (dbErr) {
-      //         console.error(`[Licenses] D1 database error for customer ${customerId}:`, dbErr);
-      //         d1Error = dbErr.message;
-      //         // Continue to try KV fallback
-      //       }
-      //     } else {
-      //       d1Error = 'D1 database not configured';
-      //     }
-
-
-      //     // If D1 failed or returned no results, try fetching by email
-      //     if (licenses.length === 0 && email) {
-      //       try {
-      //         // Get user from database by email (all data is now in D1)
-      //         const user = await getUserByEmail(env, email);
-      //         if (user && user.customers) {
-      //           // Get all customer IDs for this user
-      //           const customerIds = user.customers.map(c => c.customerId);
-      //           if (customerIds.length > 0) {
-      //             // Fetch licenses from database for all customer IDs (batched to avoid SQLite limit)
-      //             // Handle case where used_site_domain column might not exist
-      //             let licenseRes = { results: [] };
-      //             try {
-      //               // Query ALL licenses (not just active) to show complete history
-      //               licenseRes = await batchQuery(env, customerIds, async (batch) => {
-      //                 const placeholders = batch.map(() => '?').join(',');
-      //                 return env.DB.prepare(
-      //                   `SELECT license_key, site_domain, used_site_domain,platform, purchase_type, status, created_at, customer_id, subscription_id, item_id, billing_period, renewal_date FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
-      //                 ).bind(...batch).all();
-      //               });
-      //             } catch (colError) {
-      //               // Fallback if used_site_domain doesn't exist
-      //               if (colError.message && colError.message.includes('no such column: used_site_domain')) {
-      //                 try {
-      //                   licenseRes = await batchQuery(env, customerIds, async (batch) => {
-      //                     const placeholders = batch.map(() => '?').join(',');
-      //                     return env.DB.prepare(
-      //                       `SELECT license_key,platform, site_domain, status, created_at, customer_id, subscription_id, item_id, purchase_type, billing_period, renewal_date FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
-      //                     ).bind(...batch).all();
-      //                   });
-      //                 } catch (colError2) {
-      //                   // Fallback if billing_period or renewal_date don't exist
-      //                   if (colError2.message && (colError2.message.includes('no such column: billing_period') || colError2.message.includes('no such column: renewal_date'))) {
-      //                     licenseRes = await batchQuery(env, customerIds, async (batch) => {
-      //                       const placeholders = batch.map(() => '?').join(',');
-      //                       return env.DB.prepare(
-      //                         `SELECT license_key,platform, site_domain, status, created_at, customer_id, subscription_id, item_id, purchase_type FROM licenses WHERE customer_id IN (${placeholders}) ORDER BY created_at DESC`
-      //                       ).bind(...batch).all();
-      //                     });
-      //                   } else {
-      //                     throw colError2;
-      //                   }
-      //                 }
-      //               } else {
-      //                 throw colError;
-      //               }
-      //             }
-                 
-      //             // batchQuery returns { results: [] }, check if results exist
-      //             if (licenseRes && licenseRes.results) {
-      //               // Get subscription statuses for fallback licenses too (batched to avoid SQLite limit)
-      //               const fallbackSubscriptionIds = [...new Set(licenseRes.results.map(r => r.subscription_id).filter(Boolean))];
-      //               const fallbackSubscriptionStatusMap = {};
-                   
-      //               if (fallbackSubscriptionIds.length > 0 && env.DB) {
-      //                 try {
-      //                   const fallbackSubStatusRes = await batchQuery(env, fallbackSubscriptionIds, async (batch) => {
-      //                     const placeholders = batch.map(() => '?').join(',');
-      //                     return env.DB.prepare(
-      //                       `SELECT subscription_id, status, cancel_at_period_end, cancel_at, current_period_end
-      //                        FROM subscriptions
-      //                        WHERE subscription_id IN (${placeholders})`
-      //                     ).bind(...batch).all();
-      //                   });
-                       
-      //                   if (fallbackSubStatusRes && fallbackSubStatusRes.results) {
-      //                     fallbackSubStatusRes.results.forEach(sub => {
-      //                       fallbackSubscriptionStatusMap[sub.subscription_id] = {
-      //                         status: sub.status,
-      //                         cancel_at_period_end: sub.cancel_at_period_end === 1,
-      //                         cancel_at: sub.cancel_at,
-      //                         current_period_end: sub.current_period_end
-      //                       };
-      //                     });
-      //                   }
-      //                 } catch (fallbackSubErr) {
-      //                   console.error('[Licenses] Error fetching subscription statuses for fallback licenses:', fallbackSubErr);
-      //                 }
-      //               }
-                   
-      //               const userLicenses = licenseRes.results.map(l => {
-      //                 const subscriptionInfo = l.subscription_id ? fallbackSubscriptionStatusMap[l.subscription_id] : null;
-      //                 const isSubscriptionCancelled = subscriptionInfo && (
-      //                   subscriptionInfo.status === 'canceled' ||
-      //                   subscriptionInfo.cancel_at_period_end ||
-      //                   subscriptionInfo.cancel_at !== null
-      //                 );
-                     
-      //                 return {
-      //                   license_key: l.license_key,
-      //                   site_domain: l.site_domain || null,
-      //                   platform: l.platform || null,
-      //                   used_site_domain: l.used_site_domain || null,
-      //                   status: l.status || 'active',
-      //                   purchase_type: l.purchase_type || 'site',
-      //                   created_at: l.created_at,
-      //                   customer_id: l.customer_id || customerIds[0],
-      //                   subscription_id: l.subscription_id || null,
-      //                   item_id: l.item_id || null,
-      //                   billing_period: l.billing_period || null, // From licenses table
-      //                   renewal_date: l.renewal_date || subscriptionInfo?.current_period_end || null, // From licenses table or subscription
-      //                   subscription_status: subscriptionInfo?.status || null,
-      //                   subscription_cancelled: isSubscriptionCancelled || false,
-      //                   subscription_cancel_at_period_end: subscriptionInfo?.cancel_at_period_end || false,
-      //                   subscription_current_period_end: subscriptionInfo?.current_period_end || null
-      //                 };
-      //               });
-      //               licenses = [...licenses, ...userLicenses];
-      //             }
-      //           }
-      //         }
-      //       } catch (emailErr) {
-      //         console.error(`[Licenses] Error fetching licenses by email:`, emailErr);
-      //       }
-      //     }
-
-
-      //     // If D1 failed, return error
-      //     if (d1Error && licenses.length === 0) {
-      //       console.error(`[Licenses] D1 failed for email ${email}. D1: ${d1Error}`);
-      //       return jsonResponse(500, {
-      //         error: 'Failed to fetch licenses',
-      //         details: {
-      //           d1Error: d1Error
-      //         },
-      //         licenses: [] // Return empty array so frontend doesn't break
-      //       });
-      //     }
-
-
-      //     // Fetch active subscriptions for the user
-      //     let activeSubscriptions = [];
-      //     if (email && env.DB) {
-      //       try {
-      //         // Get all subscriptions for this email that are active or trialing
-      //         const subsRes = await env.DB.prepare(
-      //           `SELECT subscription_id, status, cancel_at_period_end, cancel_at, current_period_start, current_period_end, billing_period, created_at
-      //            FROM subscriptions
-      //            WHERE user_email = ? AND (status = 'active' OR status = 'trialing') AND (cancel_at_period_end = 0 OR cancel_at_period_end IS NULL)
-      //            ORDER BY created_at DESC`
-      //         ).bind(email.toLowerCase().trim()).all();
-             
-      //         if (subsRes && subsRes.results) {
-      //           activeSubscriptions = subsRes.results.map(sub => ({
-      //             subscription_id: sub.subscription_id,
-      //             status: sub.status,
-      //             cancel_at_period_end: sub.cancel_at_period_end === 1,
-      //             cancel_at: sub.cancel_at,
-      //             current_period_start: sub.current_period_start,
-      //             current_period_end: sub.current_period_end,
-      //             billing_period: sub.billing_period || null,
-      //             created_at: sub.created_at
-      //           }));
-      //         }
-      //       } catch (subsErr) {
-      //         console.error('[Licenses] Error fetching active subscriptions:', subsErr);
-      //       }
-      //     }
-
-
-      //     // Debug: Log what we're returning
-      //     if (licenses.length > 0) {
-      //       // Count by purchase_type
-      //       const quantityLicenses = licenses.filter(l => l.purchase_type === 'quantity').length;
-      //       const siteLicenses = licenses.filter(l => l.purchase_type === 'site').length;
-      //     }
-         
-      //     // Return licenses and active subscriptions
-      //     return jsonResponse(200, { success: true, licenses, activeSubscriptions }, true, request);
-      //   } catch (error) {
-      //     console.error(`[Licenses] ❌ Unexpected error fetching licenses:`, error);
-      //     console.error(`[Licenses] ❌ Error details:`, {
-      //       message: error.message,
-      //       stack: error.stack,
-      //       email: email || 'unknown',
-      //       customerId: customerId || 'unknown',
-      //       allCustomerIdsLength: allCustomerIds?.length || 0
-      //     });
-      //     return jsonResponse(500, {
-      //       error: 'Failed to fetch licenses',
-      //       message: error.message || 'An unexpected error occurred',
-      //       licenses: [], // Return empty array so frontend doesn't break
-      //       details: process.env.NODE_ENV === 'development' ? error.stack : undefined
-      //     }, true, request);
-      //   }
-      // }
-
-
-			// Get invoices endpoint - returns paid invoices for a user
-			if (request.method === 'GET' && pathname === '/api/invoices') {
+			// Get invoices endpoint - returns paid invoices for a use
+				if (request.method === 'GET' && pathname === '/api/invoices') {
 				console.log('[Invoices] Endpoint hit:', { pathname, method: request.method, url: request.url });
 				try {
 					// Try to get email from query parameter (for Memberstack users)
@@ -9379,15 +8652,17 @@ if (request.method === 'GET' && pathname === '/api/licenses/status') {
 				}
 
 				const normalizedPeriod = billingPeriodParam.toLowerCase().trim();
-				let productId, unitAmount;
+				let productId, unitAmount,price_id;
 				const currency = 'usd'; // Default to USD
 
 				if (normalizedPeriod === 'monthly') {
-					productId = env.MONTHLY_PRODUCT_ID || env.MONTHLY_LICENSE_PRODUCT_ID || 'prod_SHWZdF20XLXtn9';
+					productId = env.MONTHLY_PRODUCT_ID || env.MONTHLY_LICENSE_PRODUCT_ID || 'prod_TiG3c1jjtQHRLK';
 					unitAmount = parseInt(env.MONTHLY_UNIT_AMOUNT || env.MONTHLY_LICENSE_UNIT_AMOUNT || '800');
+					price_id = env.MONTHLY_LICENSE_PRICE_ID || "price_1SkpXkJwcuG9163MTm9SU4Uf";
 				} else if (normalizedPeriod === 'yearly') {
-					productId = env.YEARLY_PRODUCT_ID || env.YEARLY_LICENSE_PRODUCT_ID || 'prod_SJQgqC8uDgRcOi';
-					unitAmount = parseInt(env.YEARLY_UNIT_AMOUNT || env.YEARLY_LICENSE_UNIT_AMOUNT || '7500');
+					productId = env.YEARLY_PRODUCT_ID || env.YEARLY_LICENSE_PRODUCT_ID || 'prod_TiG4YkK61hiKKR';
+					unitAmount = parseInt(env.YEARLY_UNIT_AMOUNT || env.YEARLY_LICENSE_UNIT_AMOUNT || '7200');
+					price_id = env.YEARLY_LICENSE_PRICE_ID || "price_1SkpYAJwcuG9163M6U7qf1oD";
 				} else {
 					return jsonResponse(
 						400,
@@ -9426,6 +8701,8 @@ if (request.method === 'GET' && pathname === '/api/licenses/status') {
 						'metadata[license_keys_pending]': JSON.stringify(licenseKeys),
 						'metadata[usecase]': '3',
 						'metadata[product_id]': productId,
+						'metadata[price_id]': price_id,
+						'metadata[currency]': invoiceCurrency,
 						'metadata[quantity]': quantity.toString(),
 						'metadata[billing_period]': normalizedPeriod,
 					},
@@ -9461,6 +8738,7 @@ if (request.method === 'GET' && pathname === '/api/licenses/status') {
 								'payment_intent_data[metadata][license_keys_source]': 'customer_metadata', // Indicate where to find keys
 						  }),
 					'payment_intent_data[metadata][product_id]': productId, // Required: to create subscriptions after payment (webhook can get price_id from this)
+					'payment_intent_data[metadata][price_id]': price_id, // Required: to create subscriptions after payment
 					'payment_intent_data[metadata][quantity]': quantity.toString(), // Required: quantity to create
 					'payment_intent_data[metadata][currency]': invoiceCurrency, // Store currency for reference
 					'payment_intent_data[metadata][billing_period]': normalizedPeriod, // Store billing period for reference
@@ -9996,6 +9274,13 @@ if (request.method === 'GET' && pathname === '/api/licenses/status') {
 					)
 						.bind(normalizedRequestedSite, platform, timestamp, license_key)
 						.run();
+
+						//   //insert sites table 
+						// 	await env.DB.prepare(
+						// 		'INSERT INTO sites (customer_id, subscription_id, site_domain, price_id, amount_paid, currency, status, renewal_date, platform, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+						// 	).bind(
+						// 		licenseRes.customer_id,licenseRes.subscription_id,normalizedRequestedSite,licenseRes.item_id,0,'usd','active',0,platform,timestamp,timestamp
+						// 	).run();
 
 					// Step 2: Update KV storage with site details (for license key activation) - PLATFORM AWARE
 					if (licenseRes.subscription_id && licenseRes.customer_id && activeSitesKv) {

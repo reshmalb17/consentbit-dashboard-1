@@ -3,7 +3,7 @@
 	"main": "src/index.js",
 	"compatibility_date": "2024-01-01",
 	"vars": {
-		"DEFAULT_PRICE_ID": "price_1ShWWXSAczuHLTOtbNqhSk5n",
+		
 		"BASE_URL": "https://consentbit-dashboard-test.web-8fb.workers.dev",
 		"MEMBERSTACK_REDIRECT_URL": "https://dashboard.consentbit.com/dashboard"
 	},
@@ -30,7 +30,16 @@
 			{
 			"binding": "Pending_Active_site",
 			"id": "041162eac7954bb18de330676df858bf"
+		},
+		{
+			"binding": "UN_ASSIGNED_LICENSE_KEYS",
+			"id": "75ceeaf610d54418aa82480cad36e125"
 		}
+
+
+
+
+
 	],
 	"triggers": {
 		"crons": ["*/1 * * * *"]
