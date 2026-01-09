@@ -2,10 +2,10 @@
 -- Run this to create your D1 database tables
 
 -- Payments/Subscriptions table - stores payment details
-CREATE TABLE IF NOT EXISTS payments (
+CREATE TABLE IF NOT EXISTS  (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   customer_id TEXT NOT NULL,
-  subscription_id TEXT NOT NULL,
+  subscription_id TEXT NOT paymentsNULL,
   email TEXT NOT NULL,
   amount INTEGER NOT NULL,
   currency TEXT NOT NULL DEFAULT 'usd',
