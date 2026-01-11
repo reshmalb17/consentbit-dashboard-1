@@ -3119,12 +3119,12 @@ export default {
 				.bind(twelveHoursAgo)
 				.first();
 
-			// Check for pending sites queue items
-			const sitesQueueCheck = await env.DB.prepare(
-				`SELECT COUNT(*) as count FROM sitesqueue 
-         WHERE status = 'pending'
-         LIMIT 1`
-			).first();
+		// 	// Check for pending sites queue items
+		// 	const sitesQueueCheck = await env.DB.prepare(
+		// 		`SELECT COUNT(*) as count FROM sitesqueue 
+        //  WHERE status = 'pending'
+        //  LIMIT 1`
+		// 	).first();
 
 			const hasPending = (pendingCheck?.count || 0) > 0;
 			const hasFailed = (failedCheck?.count || 0) > 0;
@@ -3146,12 +3146,12 @@ export default {
 			console.log(`[SCHEDULED] 🕐 Starting scheduled queue processing at ${new Date().toISOString()}`);
 
 			// Process sites queue
-			try {
-				const sitesQueueResult = await processSitesQueue(env, 100);
-				console.log(`[SCHEDULED] Sites queue processing:`, sitesQueueResult);
-			} catch (sitesQueueErr) {
-				console.error(`[SCHEDULED] Error processing sites queue:`, sitesQueueErr);
-			}
+			// try {
+			// 	const sitesQueueResult = await processSitesQueue(env, 100);
+			// 	console.log(`[SCHEDULED] Sites queue processing:`, sitesQueueResult);
+			// } catch (sitesQueueErr) {
+			// 	console.error(`[SCHEDULED] Error processing sites queue:`, sitesQueueErr);
+			// }
 
 			// Process subscription queue
 			const queueResult = await processSubscriptionQueue(env, 100);
